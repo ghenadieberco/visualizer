@@ -612,7 +612,200 @@ function makeSilk(){
     }
   });
 }
-makeTunnel(); makeRadial(); makeTerrain(); makeWaveform(); makeStarfield(); makeSilk();
+/* --- 7. SPHERE : wire-mesh globe, glowing edges, spectral relief --- */
+function makeSphere(){
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, W/H, 0.1, 100); camera.position.set(0,0,9);
+
+  // An icosphere: near-uniform triangles, so the visible mesh reads as an even
+  // weave instead of pinching at the poles the way a lat/long sphere does.
+  const geo = new THREE.IcosahedronGeometry(1, 8);   // 1620 faces: dense enough to
+  // carry the relief, coarse enough that every edge still reads as its own line
+  geo.deleteAttribute('uv'); geo.deleteAttribute('normal');
+  // Barycentric coordinates per triangle: the fragment shader derives the
+  // wireframe from them, which gives anti-aliased, thickness-controlled,
+  // glowing edges — `wireframe:true` can only draw hard 1px lines.
+  const vcount = geo.attributes.position.count;
+  const bary = new Float32Array(vcount*3);
+  for(let i=0;i<vcount;i+=3){ bary[i*3]=1; bary[(i+1)*3+1]=1; bary[(i+2)*3+2]=1; }
+  geo.setAttribute('aBary', new THREE.BufferAttribute(bary,3));
+
+  // live spectrum as a 1-D texture: latitude samples it, so each band of the
+  // globe is driven by its own slice of the FFT (equator = lows, poles = highs)
+  const specData = new Uint8Array(BARS*4);
+  const specTex = new THREE.DataTexture(specData, BARS, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
+  specTex.minFilter = specTex.magFilter = THREE.LinearFilter;   // interpolate between bins
+  specTex.wrapS = specTex.wrapT = THREE.ClampToEdgeWrapping;
+  specTex.generateMipmaps = false; specTex.needsUpdate = true;
+
+  const U = {
+    uAmp:{value:0.10}, uLow:{value:0}, uMid:{value:0}, uHigh:{value:0},
+    uBeat:{value:0}, uPulse:{value:0}, uLevel:{value:0}, uOpacity:{value:1},
+    uGlow:{value:0.6}, uRadius:{value:3.0}, uSeed:{value:new THREE.Vector3()},
+    uSpecTex:{value:specTex}, uColA:{value:new THREE.Color()}, uColB:{value:new THREE.Color()}
+  };
+  // both passes share the *same* uniform objects, so one update drives them
+  const wireU = Object.assign({}, U, { uShrink:{value:1.0} });
+  const coreU = Object.assign({}, U, { uShrink:{value:0.992} });
+
+  const VERT = NOISE + `
+    uniform float uAmp, uLow, uMid, uHigh, uBeat, uPulse, uShrink, uRadius;
+    uniform vec3 uSeed;
+    uniform sampler2D uSpecTex;
+    attribute vec3 aBary;
+    varying vec3 vBary; varying vec3 vN; varying vec3 vWorld; varying float vRidge;
+
+    // radial displacement at direction n (unit vector on the sphere)
+    float disp(vec3 n){
+      // latitude -> FFT bin, mirrored about the equator so both hemispheres agree
+      float u = (abs(n.y)*${BARS-1}.0 + 0.5)/${BARS}.0;
+      float s = texture2D(uSpecTex, vec2(u, 0.5)).r;
+      // three octaves, each weighted by its own band: lows swell the broad lobes,
+      // mids fold the ridges, highs crinkle the surface
+      float h  = snoise(n*1.15 + uSeed)                 * (0.55 + uLow *1.10);
+      h += snoise(n*2.70 + uSeed*1.40 + 11.0) * 0.34 * (0.35 + uMid *1.30);
+      h += snoise(n*6.20 + uSeed*0.70 + 27.0) * 0.13 * (0.30 + uHigh*1.40);
+      h *= 0.55 + s*1.30;          // that latitude's energy scales its relief
+      h += s*0.55;                 // ...and bulges the band outward on its own
+      h += uBeat * 0.20 * sin(n.y*6.0 - uPulse);   // onset ripple running pole to pole
+      return h * uAmp;
+    }
+
+    void main(){
+      vBary = aBary;
+      vec3 n = normalize(position);
+      // tangent frame for finite-difference normals; the reference axis only
+      // picks the basis, so swapping it near the poles leaves no seam
+      vec3 ref = abs(n.y) < 0.985 ? vec3(0.0,1.0,0.0) : vec3(1.0,0.0,0.0);
+      vec3 T = normalize(cross(ref, n));
+      vec3 B = cross(n, T);
+      const float e = 0.045;
+      float h = disp(n);
+      vec3 pC = n * (uRadius + h);
+      vec3 nT = normalize(n + T*e); vec3 pT = nT * (uRadius + disp(nT));
+      vec3 nB = normalize(n + B*e); vec3 pB = nB * (uRadius + disp(nB));
+      vec3 N = normalize(cross(pT - pC, pB - pC));
+
+      vRidge = h / max(uAmp, 0.001);            // normalized so colour keys off shape, not loudness
+      vec4 wp = modelMatrix * vec4(pC * uShrink, 1.0);
+      vWorld = wp.xyz;
+      vN = normalize(mat3(modelMatrix) * N);    // rotation only, so no inverse-transpose needed
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }`;
+
+  // Pass 1 — the shell. Near-black, but it writes depth, so the far side of the
+  // mesh is occluded and the globe reads as a solid body rather than a cage.
+  const coreMat = new THREE.ShaderMaterial({
+    uniforms: coreU, transparent:true, side:THREE.FrontSide,
+    vertexShader: VERT,
+    fragmentShader: `
+      uniform float uOpacity, uLevel, uBeat;
+      uniform vec3 uColA, uColB;
+      varying vec3 vBary; varying vec3 vN; varying vec3 vWorld; varying float vRidge;
+      void main(){
+        vec3 N = normalize(vN);
+        vec3 V = normalize(cameraPosition - vWorld);
+        vec3 L = normalize(vec3(0.45, 0.75, 0.55));
+        float ndl = max(dot(N,L), 0.0);
+        float fres = pow(1.0 - max(dot(N,V), 0.0), 3.0);
+        vec3 body = mix(uColA, uColB, clamp(vRidge*0.35 + 0.5, 0.0, 1.0));
+        vec3 c = body * (0.030 + 0.075*ndl);                       // just enough to sit above black
+        c += body * fres * (0.16 + uLevel*0.30 + uBeat*0.22);      // silhouette rim
+        c = c/(1.0+c);
+        gl_FragColor = vec4(c, uOpacity);
+        #include <colorspace_fragment>
+      }`
+  });
+
+  // Pass 2 — the glowing wireframe, additive over the shell.
+  const wireMat = new THREE.ShaderMaterial({
+    uniforms: wireU, transparent:true, depthWrite:false,
+    blending:THREE.AdditiveBlending, side:THREE.FrontSide,
+    vertexShader: VERT,
+    fragmentShader: `
+      uniform float uOpacity, uGlow;
+      uniform vec3 uColA, uColB;
+      varying vec3 vBary; varying vec3 vN; varying vec3 vWorld; varying float vRidge;
+      void main(){
+        // fwidth keeps the line a constant width in *pixels*, so the mesh stays
+        // legible whether a triangle is facing us or skewed at the silhouette
+        vec3 w = fwidth(vBary);
+        vec3 c1 = smoothstep(vec3(0.0), w*1.25, vBary);
+        float core = 1.0 - min(min(c1.x,c1.y),c1.z);      // crisp filament
+        vec3 c2 = smoothstep(vec3(0.0), w*6.00, vBary);
+        float halo = 1.0 - min(min(c2.x,c2.y),c2.z);
+        halo *= halo;                                     // bloom, falling off into the face
+
+        vec3 V = normalize(cameraPosition - vWorld);
+        float rim = pow(1.0 - abs(dot(normalize(vN), V)), 2.5);   // edges burn at the silhouette
+        vec3 tint = mix(uColA, uColB, clamp(vRidge*0.35 + 0.5, 0.0, 1.0));
+
+        float a = clamp(core + halo*0.38, 0.0, 1.0) * uOpacity;
+        vec3 rgb = tint * uGlow * (0.75 + rim*1.15) * (1.0 + core*0.9);
+        gl_FragColor = vec4(rgb, a);
+        #include <colorspace_fragment>
+      }`
+  });
+  // WebGL1 needs the derivatives extension for fwidth(); core in WebGL2
+  coreMat.extensions = { derivatives:true }; wireMat.extensions = { derivatives:true };
+
+  const grp = new THREE.Group();
+  const core = new THREE.Mesh(geo, coreMat); core.renderOrder = 0;
+  const wire = new THREE.Mesh(geo, wireMat); wire.renderOrder = 1;
+  grp.add(core, wire); scene.add(grp);
+
+  // every driver gets its own eased envelope on top of the audio engine's, so
+  // the mesh breathes and never twitches — see NFR-8
+  const sm = { level:0, low:0, mid:0, high:0, beat:0 };
+  const specSm = new Float32Array(BARS);
+  let t = 0, pulse = 0, spin = 0.1, amp = 0.10, glow = 0.6, hue = 0.55;
+
+  presets.push({
+    name:'Sphere', desc:'wire-mesh globe · spectral relief', scene, camera,
+    resize(){ camera.aspect=W/H; camera.updateProjectionMatrix(); },
+    update(dt,A){
+      sm.level += (A.level - sm.level) * ease(dt, 5);
+      sm.low   += (A.low   - sm.low  ) * ease(dt, 4);
+      sm.mid   += (A.mid   - sm.mid  ) * ease(dt, 5);
+      sm.high  += (A.high  - sm.high ) * ease(dt, 6);
+      sm.beat  += (A.beat  - sm.beat ) * ease(dt, 9);
+
+      const sk = ease(dt, 7);
+      for(let i=0;i<BARS;i++){
+        specSm[i] += (A.spectrum[i] - specSm[i]) * sk;
+        const v = Math.max(0, Math.min(255, specSm[i]*255))|0;
+        specData[i*4]=v; specData[i*4+1]=v; specData[i*4+2]=v; specData[i*4+3]=255;
+      }
+      specTex.needsUpdate = true;
+
+      t += dt * MOTION * (0.30 + sm.level*0.55 + sm.beat*0.25);
+      pulse = (pulse + dt * MOTION * 5.0) % 6.2831853;   // wrapped: stays precise over long runs
+      // the noise domain drifts on a slow lissajous, so the relief flows over the
+      // body instead of sliding across it in one direction
+      U.uSeed.value.set(Math.sin(t*0.31)*1.6, Math.cos(t*0.27)*1.6, Math.sin(t*0.19)*1.3);
+
+      // amplitude, glow and spin are slew-limited: a loud transient swells the
+      // mesh over a few frames rather than snapping it
+      amp  += ((0.10 + sm.level*0.42 + sm.low*0.18)*MOTION - amp ) * ease(dt, 2.5);
+      glow += ((0.55 + sm.level*0.55 + sm.beat*0.45*MOTION) - glow) * ease(dt, 5);
+      spin += ((0.10 + sm.level*0.42 + sm.beat*0.20) - spin) * ease(dt, 2);
+      hue  += ((0.55 - sm.high*0.10 + sm.low*0.04) - hue) * ease(dt, 1.5);
+
+      const hu = (hue + A.time*0.010) % 1;
+      U.uColA.value.copy(col.setHSL((hu + 0.06) % 1, 0.85, 0.30));   // valleys, deep
+      U.uColB.value.copy(col.setHSL((hu + 0.88) % 1, 0.90, 0.68));   // ridges, hot
+      U.uAmp.value = amp;   U.uGlow.value = glow;  U.uPulse.value = pulse;
+      U.uLow.value = sm.low; U.uMid.value = sm.mid; U.uHigh.value = sm.high;
+      U.uLevel.value = sm.level; U.uBeat.value = sm.beat;
+      U.uOpacity.value = A.opacity;
+
+      grp.rotation.y += dt * spin * MOTION;
+      grp.rotation.x = Math.sin(t*0.23) * 0.20;
+      grp.rotation.z = Math.cos(t*0.17) * 0.10;
+    }
+  });
+}
+makeTunnel(); makeRadial(); makeTerrain(); makeWaveform(); makeStarfield(); makeSilk(); makeSphere();
 
 /* =========================================================================
    PRESET SWITCHING + RENDER LOOP

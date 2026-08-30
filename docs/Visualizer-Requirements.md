@@ -1,9 +1,10 @@
 # Visualizer — Requirements
 
-**Version:** 0.6 (draft) · **Date:** 2026-08-30 · **Status:** For review
+**Version:** 0.7 (draft) · **Date:** 2026-08-30 · **Status:** For review
 
 A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders one of several fixed presets, animated in real time from the microphone signal. A collapsible right-hand panel selects presets and controls the view and the mic.
 
+> **Changes since 0.6:** added the **Sphere** preset — a wire-mesh globe with glowing edges whose relief is displaced by level and frequency, bringing the set to seven.
 > **Changes since 0.5:** replaced **Waveform Ribbon** with **Waveform** — a real-time oscilloscope trace: a single stroked line whose curve follows the live time-domain signal, with an additive multi-pass glow, an armed edge trigger to hold the trace steady, and frame-rate-independent smoothing.
 > **Changes since 0.4:** added the **Liquid Waves** preset (black-silk sheet with anisotropic sheen), bringing the set to six; split the prototype page into `index.html` / `app.css` / `app.js`.
 > **Changes since 0.3:** replaced **Kaleidoscope** with **Waveform Ribbon**; smoothed all animations and added reduced-motion support for photosensitivity safety (see NFR-8).
@@ -17,7 +18,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 **In scope (v1)**
 
 - Full-screen visual with a collapsible right side panel.
-- Six fixed presets, each with baked-in reactive behavior.
+- Seven fixed presets, each with baked-in reactive behavior.
 - Microphone as the sole audio source, requested and started on first load.
 - Signal analysis: overall level (dB), frequency bands (FFT), and beat/onset detection.
 - Animation driven primarily by beat/onset pulses, with level as a secondary continuous driver — including whole-preset opacity.
@@ -40,7 +41,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 | Startup | Request mic permission and begin listening on first page load |
 | Zoom | Global zoom across all presets via scroll, buttons, and keys |
 | Target platform | Desktop browsers only |
-| Preset set | spectrum tunnel · radial spectrum burst · frequency terrain · waveform · starfield warp · liquid waves |
+| Preset set | spectrum tunnel · radial spectrum burst · frequency terrain · waveform · starfield warp · liquid waves · sphere |
 | Motion safety | Smoothed/slew-limited reactivity; honors OS reduce-motion; no full-screen strobing |
 
 ---
@@ -78,6 +79,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 | 4 | Waveform | Trace height + line thickness + glow gain | Uses time-domain waveform for the curve | Gentle glow swell |
 | 5 | Starfield Warp | Warp speed + streak length | Broadband energy | Hyperspace burst |
 | 6 | Liquid Waves | Fold amplitude + flow speed + sheen gain | Bands drive octave depth (low → drape, mid → creases, high → weave) | Ripple from centre + highlight flare |
+| 7 | Sphere | Displacement amplitude + edge glow + spin speed | Latitude samples the spectrum (equator → lows, poles → highs); bands weight the noise octaves | Ripple travelling pole to pole + rim flare |
 
 *Applies to all presets: overall opacity ← dB level (see FR-12).*
 
@@ -108,7 +110,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 
 ### 3.7 Interaction
 
-- **FR-27** Keyboard shortcuts: toggle panel (`H`), toggle fullscreen (`F`), select presets (`1`–`6`), next/previous preset (arrows), zoom (`+` / `-` / `0`).
+- **FR-27** Keyboard shortcuts: toggle panel (`H`), toggle fullscreen (`F`), select presets (`1`–`7`), next/previous preset (arrows), zoom (`+` / `-` / `0`).
 - **FR-28** All interactive controls are reachable and operable by keyboard with visible focus.
 
 ---
@@ -128,7 +130,8 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 
 ## 5. Technical approach (prototype)
 
-- Rendering: **Three.js** (WebGL2). Presets 1–5 build geometry on the CPU (instanced meshes, line sets, vertex-coloured meshes); preset 6 is a custom GLSL `ShaderMaterial` — simplex-noise displacement in the vertex shader, Kajiya-Kay anisotropic sheen in the fragment shader.
+- Rendering: **Three.js** (WebGL2). Presets 1–5 build geometry on the CPU (instanced meshes, line sets, vertex-coloured meshes); presets 6–7 are custom GLSL `ShaderMaterial`s — simplex-noise displacement in the vertex shader, plus Kajiya-Kay anisotropic sheen (6) and barycentric wireframe (7) in the fragment shader.
+- Sphere preset: an icosphere (near-uniform triangles) drawn twice from one geometry and one shared uniform block — a depth-writing near-black shell that occludes the far side, then an additive pass that derives glowing, screen-constant-width edges from per-triangle barycentric coordinates via `fwidth`. Vertex displacement reads the live spectrum from a 1-D `DataTexture` indexed by latitude; surface normals come from finite differences in a tangent frame.
 - Source layout: `index.html` (markup) · `app.css` · `app.js` (ES module). The module must be served over HTTP; browsers refuse module loads from `file://`.
 - Audio: **Web Audio API** — `AnalyserNode` for FFT and time-domain data; `MediaStreamSource` from `getUserMedia` for the mic (no output node). Autoplay suspension is resolved by resuming the context on the first user gesture.
 - Beat detection: spectral-flux onset with adaptive mean-based threshold, refractory ~110 ms, exponential-decay pulse envelope.
