@@ -64,7 +64,7 @@ ul{list-style:none;margin:0;padding:0}
   cursor:pointer;position:relative;border:1px solid transparent;transition:.14s;margin-bottom:4px}
 .preset:hover{background:var(--surface)}
 .preset .idx{font-family:var(--mono);font-size:11px;color:var(--muted-2);width:16px;flex:none}
-.preset .meta{min-width:0}
+.preset .meta{min-width:0;display:flex;flex-direction:column}
 .preset .name{font-size:14px;font-weight:500;line-height:1.2}
 .preset .desc{font-family:var(--mono);font-size:10px;color:var(--muted-2);letter-spacing:.02em;
   margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}

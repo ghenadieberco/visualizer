@@ -1,9 +1,10 @@
 # Visualizer — Requirements
 
-**Version:** 0.4 (draft) · **Date:** 2026-08-29 · **Status:** For review
+**Version:** 0.5 (draft) · **Date:** 2026-08-30 · **Status:** For review
 
 A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders one of several fixed presets, animated in real time from the microphone signal. A collapsible right-hand panel selects presets and controls the view and the mic.
 
+> **Changes since 0.4:** added the **Liquid Waves** preset (black-silk sheet with anisotropic sheen), bringing the set to six; split the prototype page into `index.html` / `app.css` / `app.js`.
 > **Changes since 0.3:** replaced **Kaleidoscope** with **Waveform Ribbon**; smoothed all animations and added reduced-motion support for photosensitivity safety (see NFR-8).
 > **Changes since 0.2:** replaced four presets, keeping **Radial Spectrum Burst**.
 > **Changes since 0.1:** audio source is now **microphone only** (file upload removed) and **auto-starts on load**; added **zoom** (view control) and **level-driven opacity** across all presets; removed file transport and the Space shortcut.
@@ -15,7 +16,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 **In scope (v1)**
 
 - Full-screen visual with a collapsible right side panel.
-- Five fixed presets, each with baked-in reactive behavior.
+- Six fixed presets, each with baked-in reactive behavior.
 - Microphone as the sole audio source, requested and started on first load.
 - Signal analysis: overall level (dB), frequency bands (FFT), and beat/onset detection.
 - Animation driven primarily by beat/onset pulses, with level as a secondary continuous driver — including whole-preset opacity.
@@ -38,7 +39,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 | Startup | Request mic permission and begin listening on first page load |
 | Zoom | Global zoom across all presets via scroll, buttons, and keys |
 | Target platform | Desktop browsers only |
-| Preset set | spectrum tunnel · radial spectrum burst · frequency terrain · waveform ribbon · starfield warp |
+| Preset set | spectrum tunnel · radial spectrum burst · frequency terrain · waveform ribbon · starfield warp · liquid waves |
 | Motion safety | Smoothed/slew-limited reactivity; honors OS reduce-motion; no full-screen strobing |
 
 ---
@@ -75,6 +76,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 | 3 | Frequency Terrain | Camera lift/sway | Row heights (scrolling spectrogram) | Height accent + camera lift |
 | 4 | Waveform Ribbon | Amplitude + ribbon thickness | Uses time-domain waveform for shape | Gentle thickness/brightness swell |
 | 5 | Starfield Warp | Warp speed + streak length | Broadband energy | Hyperspace burst |
+| 6 | Liquid Waves | Fold amplitude + flow speed + sheen gain | Bands drive octave depth (low → drape, mid → creases, high → weave) | Ripple from centre + highlight flare |
 
 *Applies to all presets: overall opacity ← dB level (see FR-12).*
 
@@ -105,7 +107,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 
 ### 3.7 Interaction
 
-- **FR-27** Keyboard shortcuts: toggle panel (`H`), toggle fullscreen (`F`), select presets (`1`–`5`), next/previous preset (arrows), zoom (`+` / `-` / `0`).
+- **FR-27** Keyboard shortcuts: toggle panel (`H`), toggle fullscreen (`F`), select presets (`1`–`6`), next/previous preset (arrows), zoom (`+` / `-` / `0`).
 - **FR-28** All interactive controls are reachable and operable by keyboard with visible focus.
 
 ---
@@ -125,7 +127,8 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 
 ## 5. Technical approach (prototype)
 
-- Rendering: **Three.js** (WebGL2). Presets 3–5 use custom GLSL shaders; presets 1–2 use instanced meshes.
+- Rendering: **Three.js** (WebGL2). Presets 1–5 build geometry on the CPU (instanced meshes, line sets, vertex-coloured meshes); preset 6 is a custom GLSL `ShaderMaterial` — simplex-noise displacement in the vertex shader, Kajiya-Kay anisotropic sheen in the fragment shader.
+- Source layout: `index.html` (markup) · `app.css` · `app.js` (ES module). The module must be served over HTTP; browsers refuse module loads from `file://`.
 - Audio: **Web Audio API** — `AnalyserNode` for FFT and time-domain data; `MediaStreamSource` from `getUserMedia` for the mic (no output node). Autoplay suspension is resolved by resuming the context on the first user gesture.
 - Beat detection: spectral-flux onset with adaptive mean-based threshold, refractory ~110 ms, exponential-decay pulse envelope.
 - Zoom: every preset uses a perspective or orthographic camera, so zoom is applied via the camera's `.zoom` (independent of position, so it composes with each preset's orbit/dolly/fly motion). No full-screen shader remains.

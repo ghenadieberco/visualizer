@@ -384,7 +384,131 @@ function makeStarfield(){
   });
 }
 
-makeTunnel(); makeRadial(); makeTerrain(); makeRibbon(); makeStarfield();
+/* --- 6. LIQUID WAVES : black silk sheet, anisotropic sheen, slow folds --- */
+function makeSilk(){
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, W/H, 0.1, 200); camera.position.set(0,16,17);
+  camera.lookAt(0,0,-3);
+
+  const uniforms = {
+    uTime:{value:0}, uAmp:{value:0.8}, uLevel:{value:0}, uBeat:{value:0},
+    uLow:{value:0}, uMid:{value:0}, uHigh:{value:0}, uOpacity:{value:1}, uLightPhase:{value:0}
+  };
+
+  // the sheet lies in the XZ plane; folds displace it along Y
+  const geo = new THREE.PlaneGeometry(66, 66, 320, 220);
+  const mat = new THREE.ShaderMaterial({
+    uniforms, transparent:true, side:THREE.DoubleSide,
+    vertexShader: NOISE + `
+      uniform float uTime, uAmp, uLow, uMid, uHigh, uBeat;
+      varying vec3 vWorld; varying vec3 vN; varying vec3 vT; varying vec2 vUv;
+
+      // waves roll toward the viewer as long parallel ridges: noise squashed on x
+      // makes features stretch across the sheet, which is what breaks the sheen into
+      // thin fabric-like streaks instead of round blobs
+      float folds(vec2 p){
+        float t = uTime;
+        float scroll = t * 1.6;
+        vec2 q = vec2(p.x*0.28, p.y + scroll);
+        float h  = snoise(vec3(q*0.145,        t*0.06)) * 1.15;
+        h += snoise(vec3(q*0.340 + 17.0, t*0.10)) * 0.42 * (0.60 + uLow*1.3);
+        h += snoise(vec3(q*0.800 + 31.0, t*0.16)) * 0.08 * (0.50 + uMid*1.2);
+        // fine weave ripples across the drape — the detail that makes it read as cloth
+        h += sin((p.y+scroll)*1.90 + snoise(vec3(p*0.05, t*0.10))*2.6) * 0.085 * (0.55 + uHigh*1.3);
+        h += sin((p.y+scroll)*4.40 + snoise(vec3(p*0.09, t*0.14))*3.4) * 0.018;
+        float d = length(p);                       // onset ripple leaving the centre
+        h += uBeat * 0.45 * sin(d*0.45 - t*3.0) * exp(-d*0.045);
+        return h * uAmp;
+      }
+
+      void main(){
+        vUv = uv;
+        vec2 p = position.xy;
+        float e = 0.30;                            // finite-difference step for normals
+        float h  = folds(p);
+        float hx = folds(p + vec2(e,0.0));
+        float hy = folds(p + vec2(0.0,e));
+        vec3 T = normalize(vec3(e, 0.0, hx-h));    // weave direction, drives the anisotropy
+        vec3 B = normalize(vec3(0.0, e, hy-h));
+        vec3 N = normalize(cross(T,B));
+        vec4 wp = modelMatrix * vec4(position.xy, h, 1.0);
+        vWorld = wp.xyz;
+        vN = normalize(normalMatrix * N);
+        vT = normalize(normalMatrix * T);
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }`,
+    fragmentShader: `
+      uniform float uLevel, uBeat, uOpacity, uLightPhase;
+      varying vec3 vWorld; varying vec3 vN; varying vec3 vT; varying vec2 vUv;
+
+      // Kajiya-Kay: highlight stretched along the thread, not a round plastic dot
+      float sheen(vec3 T, vec3 L, vec3 V, float e){
+        float tl = dot(T,L), tv = dot(T,V);
+        return pow(max(sqrt(1.0-tl*tl)*sqrt(1.0-tv*tv) - tl*tv, 0.0), e);
+      }
+
+      void main(){
+        vec3 N = normalize(vN);
+        if(!gl_FrontFacing) N = -N;
+        vec3 T = normalize(vT);
+        vec3 V = normalize(cameraPosition - vWorld);
+
+        vec3 L1 = normalize(vec3(sin(uLightPhase)*0.85, 0.70, cos(uLightPhase)*0.85)); // key, drifting
+        vec3 L2 = normalize(vec3(-0.80, 0.45, -0.75));                                 // cool back rim
+
+        float ndl = max(dot(N,L1), 0.0);
+        float lit = smoothstep(0.05, 0.45, ndl);      // keep the far side of every fold black
+        vec3 c = vec3(0.0022,0.0026,0.0040) * (0.25 + 0.75*ndl);
+
+        float g1 = pow(max(dot(N, normalize(L1+V)), 0.0), 260.0);   // tight wet glint
+        float g2 = pow(max(dot(N, normalize(L2+V)), 0.0), 120.0);
+        float a1 = sheen(T, L1, V, 150.0) * lit;                    // narrow ribbon along the folds
+        float a2 = sheen(T, L2, V, 70.0);
+        float fres = pow(1.0 - max(dot(N,V), 0.0), 6.0);
+
+        float glint = 1.0 + uBeat*0.8;                              // onset lifts the shine
+        c += vec3(0.85,0.90,1.00) * g1 * 1.10 * glint;
+        c += vec3(0.26,0.58,0.66) * g2 * 0.10;
+        // broad satin band, plus a tight near-white core along its crest — the band alone
+        // reads soft and chalky, the core is what makes it look wet and shiny
+        c += vec3(0.62,0.70,0.86) * a1 * 0.20 * (0.60 + uLevel*1.1);
+        c += vec3(0.96,0.98,1.00) * pow(a1,5.0) * 0.60 * glint;
+        c += vec3(0.30,0.78,0.86) * a2 * 0.05 * lit;
+        c += vec3(0.26,0.24,0.42) * fres * (0.045 + uLevel*0.09 + uBeat*0.04);
+
+        c = c / (1.0 + c);                                      // soft highlight rolloff
+
+        // dissolve the sheet's borders into the background instead of cutting them off
+        float edge = smoothstep(0.0,0.10,vUv.x) * smoothstep(1.0,0.90,vUv.x)
+                   * smoothstep(0.0,0.06,vUv.y) * smoothstep(1.0,0.68,vUv.y);
+        gl_FragColor = vec4(c, uOpacity * edge);
+        #include <colorspace_fragment>
+      }`
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.x = -Math.PI/2; mesh.position.z = -2;
+  scene.add(mesh);
+
+  let t = 0, phase = 0;
+  presets.push({
+    name:'Liquid Waves', desc:'black silk · anisotropic sheen', scene, camera,
+    resize(){ camera.aspect=W/H; camera.updateProjectionMatrix(); },
+    update(dt,A){
+      // the drape flows faster when it is loud, but never snaps
+      t += dt * MOTION * (0.55 + A.level*0.9 + A.beat*0.35);
+      phase += dt * MOTION * 0.16;
+      uniforms.uTime.value = t;
+      uniforms.uLightPhase.value = phase;
+      uniforms.uAmp.value += ((0.55 + A.level*1.35 + A.low*0.55) - uniforms.uAmp.value) * Math.min(1, dt*3);
+      uniforms.uLevel.value = A.level; uniforms.uBeat.value = A.beat;
+      uniforms.uLow.value = A.low; uniforms.uMid.value = A.mid; uniforms.uHigh.value = A.high;
+      uniforms.uOpacity.value = A.opacity;
+      camera.position.y = 16 + Math.sin(t*0.25)*0.8 + A.beat*0.6;
+      camera.lookAt(0,0,-3);
+    }
+  });
+}
+makeTunnel(); makeRadial(); makeTerrain(); makeRibbon(); makeStarfield(); makeSilk();
 
 /* =========================================================================
    PRESET SWITCHING + RENDER LOOP
@@ -413,6 +537,7 @@ function loop(){
    ========================================================================= */
 const app = document.getElementById('app');
 const presetList = document.getElementById('presetList');
+document.getElementById('presetHint').textContent = `1\u2013${presets.length}`;
 presets.forEach((p,i)=>{
   const li=document.createElement('li');
   li.className='preset'+(i===0?' active':''); li.tabIndex=0;
@@ -507,7 +632,7 @@ addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT') return;
   if(e.key==='h'||e.key==='H') app.classList.toggle('collapsed');
   else if(e.key==='f'||e.key==='F') toggleFs();
-  else if(e.key>='1'&&e.key<='5') selectPreset(+e.key-1);
+  else if(e.key>='1'&&e.key<='9'&&+e.key<=presets.length) selectPreset(+e.key-1);
   else if(e.key==='ArrowRight') selectPreset(active+1);
   else if(e.key==='ArrowLeft') selectPreset(active-1);
   else if(e.key==='+'||e.key==='=') zoomBy(1.15);
