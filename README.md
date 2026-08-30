@@ -1,8 +1,8 @@
 # Visualizer
 
-A browser-based, audio-reactive visualizer. A full-screen WebGL canvas (Three.js) renders one of five fixed presets, animated in real time from the microphone signal.
+A browser-based, audio-reactive visualizer. A full-screen WebGL canvas (Three.js) renders one of six fixed presets, animated in real time from the microphone signal.
 
-**Presets:** Spectrum Tunnel · Radial Spectrum Burst · Frequency Terrain · Waveform Ribbon · Starfield Warp · Liquid Waves
+**Presets:** Spectrum Tunnel · Radial Spectrum Burst · Frequency Terrain · Waveform · Starfield Warp · Liquid Waves
 
 - **Mic-driven:** requests microphone access on load and analyses it locally — level (dB), FFT bands, waveform, and spectral-flux beat detection. Audio is never routed to output, recorded, or transmitted.
 - **Beat-first reactivity:** onsets drive pulses, with level as a secondary continuous driver, including whole-scene opacity (floored so silence dims rather than blanks).

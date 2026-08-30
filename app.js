@@ -22,7 +22,7 @@ const MOTION = REDUCED_MOTION ? 0.5 : 1;
    AUDIO ENGINE  —  dB level + FFT bands + spectral-flux onset detection
    ========================================================================= */
 const BARS = 64;                     // downsampled spectrum resolution for visuals
-const WAVE = 128;                    // downsampled time-domain waveform for the ribbon
+const WAVE = 512;                    // downsampled time-domain waveform for the oscilloscope trace
 const Audio = {
   ctx:null, analyser:null, gain:null,
   freq:null, timeF:null, prevSpec:null,
@@ -30,11 +30,14 @@ const Audio = {
   // published, smoothed values read by presets + UI
   level:0, levelDb:-100, beat:0, beatRaw:0, low:0, mid:0, high:0, time:0, opacity:1,
   spectrum:new Float32Array(BARS),
-  wave:new Float32Array(WAVE),
+  wave:new Float32Array(WAVE), wavePeak:0,
   // onset internals
   fluxHist:[], lastBeat:0, sensitivity:1.3, beatTimes:[], bpm:0,
   peakLevel:0
 };
+
+// frame-rate independent exponential smoothing: same feel at 30 or 144 fps
+const ease = (dt, rate) => 1 - Math.exp(-dt*rate);
 
 function ensureCtx(){
   if (Audio.ctx) return;
@@ -98,10 +101,32 @@ function analyse(dt){
   a.opacity += (opFloor + a.level*opSpan - a.opacity) * 0.12;
   a.peakLevel = Math.max(a.peakLevel*0.985, a.level);
 
-  // --- downsampled time-domain waveform (smoothed for flow) ---
+  // --- time-domain waveform, oscilloscope style ---
+  const tf = a.timeF, tlen = tf.length;
+  let rp = 0; for (let i=0;i<tlen;i++){ const v = Math.abs(tf[i]); if (v>rp) rp = v; }
+  a.wavePeak += (rp - a.wavePeak) * ease(dt, rp>a.wavePeak ? 18 : 1.5);
+
+  // Armed edge trigger (fires on a rise past +thr only after dipping below
+  // -thr) so a steady tone draws a steady trace instead of sliding sideways
+  // every frame; the threshold tracks the signal so noise can't trigger it.
+  const thr = Math.max(0.006, a.wavePeak*0.3);
+  let start = 0, armed = false;
+  for (let i=0;i<tlen>>2;i++){
+    const v = tf[i];
+    if (!armed){ if (v < -thr) armed = true; }
+    else if (v > thr){ start = i; break; }
+  }
+
+  // Box-filtered downsample of a ~21 ms window — averaging each bucket instead
+  // of point-sampling it removes the aliasing that made the curve look jagged,
+  // and the short window keeps individual cycles readable rather than packed.
+  const bucket = Math.min(tlen - start, tlen*0.5)/WAVE;
+  const wk = ease(dt, REDUCED_MOTION ? 14 : 34);   // light: the trace must stay live
   for (let i=0;i<WAVE;i++){
-    const s = a.timeF[Math.floor(i/WAVE*a.timeF.length)];
-    a.wave[i] += (s - a.wave[i]) * 0.35;
+    const i0 = start + Math.floor(i*bucket);
+    const i1 = Math.max(i0+1, start + Math.floor((i+1)*bucket));
+    let acc = 0; for (let j=i0;j<i1;j++) acc += tf[j];
+    a.wave[i] += (acc/(i1-i0) - a.wave[i]) * wk;
   }
 
   // --- bands ---
@@ -303,46 +328,124 @@ function makeTerrain(){
   });
 }
 
-/* --- 4. WAVEFORM RIBBON : flowing oscilloscope ribbon (calm, non-flashing) --- */
-function makeRibbon(){
+/* --- 4. WAVEFORM : real-time oscilloscope trace with additive glow --- */
+function makeWaveform(){
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(50, W/H, 0.1, 100); camera.position.set(0,0,9);
-  const P = WAVE, width = 16;
-  const g = new THREE.BufferGeometry();
-  const pos = new Float32Array(P*2*3);      // two verts (top/bottom) per waveform point
-  const colr = new Float32Array(P*2*3);
-  const idx = [];
-  for(let i=0;i<P-1;i++){
-    const t0=i*2, b0=i*2+1, t1=(i+1)*2, b1=(i+1)*2+1;
-    idx.push(t0,b0,t1, b0,b1,t1);
+  const P = WAVE;
+  let width = 18, halfH = 4;                 // world size of the viewport, set by fit()
+
+  // A polyline stroked as a triangle strip: three verts per sample (top /
+  // centre / bottom) pushed along the local curve normal, so thickness stays
+  // even through steep slopes AND each pass can fade from a bright centre to
+  // transparent edges. Stacking a few passes (wide+dim -> thin+bright) builds
+  // the glow additively, far cheaper than a full bloom post-pass.
+  function makeStroke(){
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P*3*3), 3));
+    g.setAttribute('color',    new THREE.BufferAttribute(new Float32Array(P*3*3), 3));
+    const idx = [];
+    for(let i=0;i<P-1;i++){
+      const t0=i*3, m0=t0+1, b0=t0+2, t1=t0+3, m1=t1+1, b1=t1+2;
+      idx.push(t0,m0,t1, m0,m1,t1, m0,b0,m1, b0,b1,m1);
+    }
+    g.setIndex(idx);
+    const m = new THREE.MeshBasicMaterial({
+      vertexColors:true, transparent:true, depthWrite:false,
+      blending:THREE.AdditiveBlending, side:THREE.DoubleSide
+    });
+    const mesh = new THREE.Mesh(g, m); mesh.frustumCulled = false; scene.add(mesh);
+    return { g, m, mesh, pos:g.attributes.position.array, colr:g.attributes.color.array };
   }
-  g.setAttribute('position', new THREE.BufferAttribute(pos,3));
-  g.setAttribute('color', new THREE.BufferAttribute(colr,3));
-  g.setIndex(idx);
-  const mat = new THREE.MeshBasicMaterial({ vertexColors:true, transparent:true, side:THREE.DoubleSide });
-  const ribbon = new THREE.Mesh(g, mat);
-  const grp = new THREE.Group(); grp.add(ribbon); scene.add(grp);
+  // widest/faintest first so the bright core lands on top. `edge` is how much
+  // colour survives at the outer edge: 0 = soft halo, 1 = solid line.
+  // `edge` is how much colour survives at the outer edge (0 = soft halo,
+  // 1 = solid line). `miter` blends the offset direction between straight up
+  // (0) and the true curve normal (1): a wide pass offset along the normal
+  // self-intersects at tight bends and throws off visible fans, so only the
+  // thin core — where the offset stays well inside the turn radius — miters.
+  const layers = [
+    { s:makeStroke(), thick:22,  gain:0.10, light:0.42, edge:0.00, miter:0.0 },  // outer bloom
+    { s:makeStroke(), thick: 9,  gain:0.16, light:0.48, edge:0.00, miter:0.0 },  // halo
+    { s:makeStroke(), thick: 3.4,gain:0.34, light:0.56, edge:0.15, miter:0.45 }, // inner glow
+    { s:makeStroke(), thick: 1,  gain:0.95, light:0.70, edge:0.85, miter:1.0 }   // core hairline
+  ];
+  layers.forEach((l,i)=>{ l.s.mesh.renderOrder = i+1; });   // core paints last
+
+  // dim centre axis so the trace still reads as a line when the room is silent
+  const axisG = new THREE.BufferGeometry();
+  axisG.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-9,0,-0.01, 9,0,-0.01]), 3));
+  const axis = new THREE.Line(axisG, new THREE.LineBasicMaterial({ color:0x2a4a63, transparent:true }));
+  scene.add(axis);
+
+  const xs = new Float32Array(P), ys = new Float32Array(P), sm = new Float32Array(P);
+  let sDrive = 0, sHue = 0.52;                // eased envelopes, never stepped per frame
+
+  function fit(){
+    camera.aspect = W/H; camera.updateProjectionMatrix();
+    const vh = 2*Math.tan(camera.fov*Math.PI/360)*camera.position.z;
+    halfH = vh/2;
+    width = vh*camera.aspect*1.04;            // slight overscan so the ends run off-screen
+    const ap = axisG.attributes.position.array;
+    ap[0] = -width/2; ap[3] = width/2;
+    axisG.attributes.position.needsUpdate = true;
+  }
+  fit();
+
+  function stroke(L, th, hue, lightSpan, opacity){
+    const { pos, colr } = L.s;
+    const edge = L.edge, mi = L.miter;
+    for(let i=0;i<P;i++){
+      const p0 = Math.max(0,i-1), p1 = Math.min(P-1,i+1);
+      const tx = xs[p1]-xs[p0], ty = ys[p1]-ys[p0];
+      const len = Math.hypot(tx,ty) || 1;
+      // blend the curve normal toward vertical; x is monotonic so the normal
+      // never flips and the blend stays well conditioned
+      let dx = -ty/len*mi, dy = (tx/len)*mi + (1-mi);
+      const dl = Math.hypot(dx,dy) || 1;
+      const nx = dx/dl*th, ny = dy/dl*th;
+      const k = i*9, x = xs[i], y = ys[i];
+      pos[k]  =x+nx; pos[k+1]=y+ny; pos[k+2]=0;   // top edge
+      pos[k+3]=x;    pos[k+4]=y;    pos[k+5]=0;   // centre
+      pos[k+6]=x-nx; pos[k+7]=y-ny; pos[k+8]=0;   // bottom edge
+      // taper both ends so the trace fades out instead of stopping dead
+      const e = i/(P-1), t = Math.min(1, Math.min(e,1-e)/0.10);
+      const f = t*t*(3-2*t)*opacity, fe = f*edge;
+      col.setHSL(hue, 0.75, L.light + Math.min(1, Math.abs(y)/halfH*2.2)*lightSpan);
+      colr[k]  =col.r*fe; colr[k+1]=col.g*fe; colr[k+2]=col.b*fe;
+      colr[k+3]=col.r*f;  colr[k+4]=col.g*f;  colr[k+5]=col.b*f;
+      colr[k+6]=col.r*fe; colr[k+7]=col.g*fe; colr[k+8]=col.b*fe;
+    }
+    L.s.g.attributes.position.needsUpdate = true;
+    L.s.g.attributes.color.needsUpdate = true;
+  }
+
   presets.push({
-    name:'Waveform Ribbon', desc:'flowing oscilloscope · calm', scene, camera,
-    resize(){ camera.aspect=W/H; camera.updateProjectionMatrix(); },
+    name:'Waveform', desc:'live oscilloscope trace · glow', scene, camera,
+    resize: fit,
     update(dt,A){
-      const amp = 2.2 + A.level*3.0;
-      const th  = 0.10 + A.level*0.35 + A.beat*0.25;   // gentle thickness swell
+      // height follows the input level: silence sits near flat, loud fills the
+      // frame — eased so the trace grows and settles instead of snapping
+      sDrive += (Math.min(1, A.level*1.5) - sDrive) * ease(dt, 6);
+      const norm = 1/Math.max(A.wavePeak, 0.02);   // mic samples sit far below full scale
+      const amp  = halfH*(0.05 + sDrive*0.80 + A.beat*0.05*MOTION);
+
+      // 1-2-1 pass over the samples: rounds the polyline without dulling the shape
+      for(let i=0;i<P;i++) sm[i] = THREE.MathUtils.clamp(A.wave[i]*norm, -1.4, 1.4);
       for(let i=0;i<P;i++){
-        const x = (i/(P-1)-0.5)*width;
-        const y = A.wave[i]*amp;
-        const z = Math.sin(i*0.18 + A.time*1.2)*1.1;   // slow travelling 3D wave
-        const k = i*6;
-        pos[k]  =x; pos[k+1]=y+th; pos[k+2]=z;
-        pos[k+3]=x; pos[k+4]=y-th; pos[k+5]=z;
-        col.setHSL((0.55 + i/P*0.25 + A.time*0.01)%1, 0.6, 0.42 + Math.abs(A.wave[i])*0.3 + A.beat*0.06);
-        colr[k]=col.r;   colr[k+1]=col.g;   colr[k+2]=col.b;
-        colr[k+3]=col.r; colr[k+4]=col.g;   colr[k+5]=col.b;
+        const a0 = sm[Math.max(0,i-1)], b0 = sm[Math.min(P-1,i+1)];
+        xs[i] = (i/(P-1)-0.5)*width;
+        ys[i] = (a0 + sm[i]*2 + b0) * 0.25 * amp;
       }
-      g.attributes.position.needsUpdate=true; g.attributes.color.needsUpdate=true;
-      mat.opacity=A.opacity;
-      grp.rotation.y = Math.sin(A.time*0.2)*0.5;        // slow, bounded sway (no spinning)
-      grp.rotation.x = -0.15 + Math.sin(A.time*0.15)*0.1;
+
+      // hue drifts slowly and warms with level; glow swells on onsets
+      sHue += (0.52 - sDrive*0.09 - sHue) * ease(dt, 2);
+      const hue  = (sHue + A.time*0.012) % 1;
+      const base = halfH*(0.006 + sDrive*0.006);
+      const glow = 1 + A.level*0.5 + A.beat*0.6*MOTION;
+      for(const L of layers) stroke(L, base*L.thick, hue, 0.20, L.gain*glow*A.opacity);
+
+      axis.material.opacity = 0.10 + (1-sDrive)*0.20;
     }
   });
 }
@@ -508,7 +611,7 @@ function makeSilk(){
     }
   });
 }
-makeTunnel(); makeRadial(); makeTerrain(); makeRibbon(); makeStarfield(); makeSilk();
+makeTunnel(); makeRadial(); makeTerrain(); makeWaveform(); makeStarfield(); makeSilk();
 
 /* =========================================================================
    PRESET SWITCHING + RENDER LOOP

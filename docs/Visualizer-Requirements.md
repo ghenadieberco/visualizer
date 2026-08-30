@@ -1,9 +1,10 @@
 # Visualizer — Requirements
 
-**Version:** 0.5 (draft) · **Date:** 2026-08-30 · **Status:** For review
+**Version:** 0.6 (draft) · **Date:** 2026-08-30 · **Status:** For review
 
 A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders one of several fixed presets, animated in real time from the microphone signal. A collapsible right-hand panel selects presets and controls the view and the mic.
 
+> **Changes since 0.5:** replaced **Waveform Ribbon** with **Waveform** — a real-time oscilloscope trace: a single stroked line whose curve follows the live time-domain signal, with an additive multi-pass glow, an armed edge trigger to hold the trace steady, and frame-rate-independent smoothing.
 > **Changes since 0.4:** added the **Liquid Waves** preset (black-silk sheet with anisotropic sheen), bringing the set to six; split the prototype page into `index.html` / `app.css` / `app.js`.
 > **Changes since 0.3:** replaced **Kaleidoscope** with **Waveform Ribbon**; smoothed all animations and added reduced-motion support for photosensitivity safety (see NFR-8).
 > **Changes since 0.2:** replaced four presets, keeping **Radial Spectrum Burst**.
@@ -39,7 +40,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 | Startup | Request mic permission and begin listening on first page load |
 | Zoom | Global zoom across all presets via scroll, buttons, and keys |
 | Target platform | Desktop browsers only |
-| Preset set | spectrum tunnel · radial spectrum burst · frequency terrain · waveform ribbon · starfield warp · liquid waves |
+| Preset set | spectrum tunnel · radial spectrum burst · frequency terrain · waveform · starfield warp · liquid waves |
 | Motion safety | Smoothed/slew-limited reactivity; honors OS reduce-motion; no full-screen strobing |
 
 ---
@@ -74,7 +75,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 | 1 | Spectrum Tunnel | Fly-through speed | Ring radius profile (per-segment) | Speed surge + brightness |
 | 2 | Radial Spectrum Burst | Rotation speed | Mirrored ray lengths | Radial flare (ring expands) |
 | 3 | Frequency Terrain | Camera lift/sway | Row heights (scrolling spectrogram) | Height accent + camera lift |
-| 4 | Waveform Ribbon | Amplitude + ribbon thickness | Uses time-domain waveform for shape | Gentle thickness/brightness swell |
+| 4 | Waveform | Trace height + line thickness + glow gain | Uses time-domain waveform for the curve | Gentle glow swell |
 | 5 | Starfield Warp | Warp speed + streak length | Broadband energy | Hyperspace burst |
 | 6 | Liquid Waves | Fold amplitude + flow speed + sheen gain | Bands drive octave depth (low → drape, mid → creases, high → weave) | Ripple from centre + highlight flare |
 
@@ -95,7 +96,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 - **FR-20** Compute an FFT spectrum and derive Low / Mid / High band energies.
 - **FR-21** Detect beats/onsets from spectral flux with an adaptive threshold and a refractory window; emit a decaying pulse (1 → 0) that presets consume.
 - **FR-22** A user-adjustable **sensitivity** control tunes onset detection.
-- **FR-29** Extract a time-domain waveform (used by the Waveform Ribbon preset).
+- **FR-29** Extract a time-domain waveform for the Waveform preset: box-filtered downsample of a short window, aligned by an armed edge trigger (threshold tracking the signal peak) so a steady tone draws a steady trace, and normalized against a smoothed peak so quiet input still reads.
 - **FR-30** All reactive signals are smoothed/slew-limited before driving visuals: gentle level attack/release, a floored and low-passed opacity, and a beat pulse that rises with a slew limit and decays gradually (see NFR-8).
 
 ### 3.6 Signal console (panel readouts)
