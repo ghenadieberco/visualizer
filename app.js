@@ -357,8 +357,7 @@ function makeWaveform(){
     const mesh = new THREE.Mesh(g, m); mesh.frustumCulled = false; scene.add(mesh);
     return { g, m, mesh, pos:g.attributes.position.array, colr:g.attributes.color.array };
   }
-  // widest/faintest first so the bright core lands on top. `edge` is how much
-  // colour survives at the outer edge: 0 = soft halo, 1 = solid line.
+  // Widest/faintest first, so the bright core lands on top.
   // `edge` is how much colour survives at the outer edge (0 = soft halo,
   // 1 = solid line). `miter` blends the offset direction between straight up
   // (0) and the true curve normal (1): a wide pass offset along the normal
@@ -401,7 +400,7 @@ function makeWaveform(){
       const len = Math.hypot(tx,ty) || 1;
       // blend the curve normal toward vertical; x is monotonic so the normal
       // never flips and the blend stays well conditioned
-      let dx = -ty/len*mi, dy = (tx/len)*mi + (1-mi);
+      const dx = -ty/len*mi, dy = (tx/len)*mi + (1-mi);
       const dl = Math.hypot(dx,dy) || 1;
       const nx = dx/dl*th, ny = dy/dl*th;
       const k = i*9, x = xs[i], y = ys[i];
@@ -428,10 +427,12 @@ function makeWaveform(){
       // frame — eased so the trace grows and settles instead of snapping
       sDrive += (Math.min(1, A.level*1.5) - sDrive) * ease(dt, 6);
       const norm = 1/Math.max(A.wavePeak, 0.02);   // mic samples sit far below full scale
-      const amp  = halfH*(0.05 + sDrive*0.80 + A.beat*0.05*MOTION);
+      const amp  = halfH*(0.05 + sDrive*0.70 + A.beat*0.05*MOTION);
 
+      // tanh soft-limits instead of clipping, so a peak louder than the tracked
+      // average compresses into the frame with its shape intact
+      for(let i=0;i<P;i++) sm[i] = Math.tanh(A.wave[i]*norm*0.85)*1.15;
       // 1-2-1 pass over the samples: rounds the polyline without dulling the shape
-      for(let i=0;i<P;i++) sm[i] = THREE.MathUtils.clamp(A.wave[i]*norm, -1.4, 1.4);
       for(let i=0;i<P;i++){
         const a0 = sm[Math.max(0,i-1)], b0 = sm[Math.min(P-1,i+1)];
         xs[i] = (i/(P-1)-0.5)*width;
