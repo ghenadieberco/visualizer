@@ -1,9 +1,10 @@
 # Visualizer — Requirements
 
-**Version:** 0.7 (draft) · **Date:** 2026-08-30 · **Status:** For review
+**Version:** 0.8 (draft) · **Date:** 2026-08-31 · **Status:** For review
 
 A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders one of several fixed presets, animated in real time from the microphone signal. A collapsible right-hand panel selects presets and controls the view and the mic.
 
+> **Changes since 0.7:** added a global **Effects** panel group — Glow (bloom), Move (random drift) and Color (saturation + brightness) — and **drag-to-look** in the viewport. Presets stay fixed; these compose on top of them.
 > **Changes since 0.6:** added the **Sphere** preset — a wire-mesh globe with glowing edges whose relief is displaced by level and frequency, bringing the set to seven.
 > **Changes since 0.5:** replaced **Waveform Ribbon** with **Waveform** — a real-time oscilloscope trace: a single stroked line whose curve follows the live time-domain signal, with an additive multi-pass glow, an armed edge trigger to hold the trace steady, and frame-rate-independent smoothing.
 > **Changes since 0.4:** added the **Liquid Waves** preset (black-silk sheet with anisotropic sheen), bringing the set to six; split the prototype page into `index.html` / `app.css` / `app.js`.
@@ -40,6 +41,8 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 | Audio source | **Microphone only**; file upload removed for v1 |
 | Startup | Request mic permission and begin listening on first page load |
 | Zoom | Global zoom across all presets via scroll, buttons, and keys |
+| Effects | Global glow, movement and colour intensity, layered over any preset |
+| Camera | Drag to look around; composes with zoom and each preset's own motion |
 | Target platform | Desktop browsers only |
 | Preset set | spectrum tunnel · radial spectrum burst · frequency terrain · waveform · starfield warp · liquid waves · sphere |
 | Motion safety | Smoothed/slew-limited reactivity; honors OS reduce-motion; no full-screen strobing |
@@ -60,6 +63,16 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 - **FR-5** The user can zoom the visual in and out. Zoom applies to whichever preset is active and is shared (persists) across preset switches.
 - **FR-6** Zoom is reachable three ways: scroll wheel over the canvas, panel buttons (−/+/Reset) with a live percentage readout, and keys (`+` / `-` / `0` reset).
 - **FR-7** Zoom is clamped to a sensible range (currently 30%–600%) and composes with each preset's own camera motion (orbit/dolly) rather than replacing it.
+- **FR-7a** Dragging the canvas looks around the scene: horizontal drag yaws, vertical drag pitches (clamped to ±1.2 rad so the view cannot invert). It composes with zoom, with Movement, and with the preset's own camera motion.
+- **FR-7b** *View › Reset*, the `0` key and a double-click on the canvas all recentre zoom **and** the drag orientation.
+
+### 3.2a Effects (global)
+
+Three controls in a panel **Effects** group, applied to whichever preset is active and persisting across preset switches. Each is inert at its default, so a fresh load looks exactly as it did before the group existed.
+
+- **FR-7c Glow** (0–100%, default 0) drives a bloom post-pass. The slider moves strength, luminance threshold and radius together — low settings halo only the hottest cores, high settings pull progressively more of the image into the glow — so the travel across the slider is visible rather than on/off. It glows what the preset draws and must not lift the background. Onsets swell it slightly.
+- **FR-7d Movement** (0–100%, default 0) adds a slow random drift — rotation plus sway — on top of whatever the preset already animates. Amplitude and drift rate both scale with the slider, so it reads as motion *intensity*. Targets are re-rolled on a timer and kicked on strong onsets; sway is scaled by camera distance so one slider reads the same across presets of very different world sizes. Damped by `prefers-reduced-motion` (NFR-8).
+- **FR-7e Color** (0–200%, default 100%) scales saturation and brightness together: 0 is desaturated and dark, 100% is the preset as authored, 200% is vivid and hot.
 
 ### 3.3 Presets
 
@@ -135,9 +148,15 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 - Source layout: `index.html` (markup) · `app.css` · `app.js` (ES module). The module must be served over HTTP; browsers refuse module loads from `file://`.
 - Audio: **Web Audio API** — `AnalyserNode` for FFT and time-domain data; `MediaStreamSource` from `getUserMedia` for the mic (no output node). Autoplay suspension is resolved by resuming the context on the first user gesture.
 - Beat detection: spectral-flux onset with adaptive mean-based threshold, refractory ~110 ms, exponential-decay pulse envelope.
+- Effects: an `EffectComposer` chain — `RenderPass` → `UnrealBloomPass` → colour grade (`ShaderPass`). The composer is bypassed entirely while every effect sits at its default, so the untouched app renders straight to the canvas at no cost; the bloom pass is `enabled = false` until Glow leaves zero.
+- Effects performance: every pass reads and writes the whole frame, so the chain is kept short. The grade pass also performs the linear → sRGB encode (saving a separate `OutputPass`), and the composer target carries **no MSAA** — resolving a multisampled half-float target every frame cost more than the rest of the chain combined (~3x the frame time). Together these cut the cost of an effect being on by roughly 3x, taking colour intensity to near free.
+- Bloom resolution: the mip chain runs at the full drawing buffer, stepping down to 0.7 only above ~2.6 Mpx (4K, HiDPI over 1440p). Half resolution is cheaper still, but bands the halo on a thin bright trace and spreads it much wider — the frame-wide wash the glow is meant to avoid.
+- Trade-off: with an effect on, edges are aliased where the direct path gets `antialias: true`. FXAA folded into the grade pass is the cheap way back if it proves visible.
+- Render-target colour space: each preset scene sets `scene.background`. Without it, `RenderPass` clears a bound render target with the canvas-space (sRGB) clear value while the buffer is linear, and `OutputPass` then encodes it a second time — greying the whole frame. Naming the background makes three clear it in the working space instead.
+- Drag + movement: both are summed into `scene.rotation` / `scene.position` of the preset's scene root, which no preset touches itself, and the root is fully reassigned every frame so nothing accumulates. Movement uses six eased random-walk channels (rotation xyz + sway xyz).
 - Zoom: every preset uses a perspective or orthographic camera, so zoom is applied via the camera's `.zoom` (independent of position, so it composes with each preset's orbit/dolly/fly motion). No full-screen shader remains.
 - Opacity: instanced-mesh presets set `material.opacity`; shader presets multiply a `uOpacity` uniform into output alpha. Both fed from the normalized dB level with a floor.
-- Dependency note: the prototype loads Three.js from a CDN and needs network access on first load.
+- Dependency note: the prototype loads Three.js and its `examples/jsm` post-processing addons from a CDN (via an import map) and needs network access on first load.
 
 ---
 
@@ -157,7 +176,9 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 
 1. Should band split points (Low/Mid/High crossover frequencies) be fixed or configurable?
 2. Confirm the opacity floor (~15%) and zoom range (30%–600%) — keep, or expose as settings?
-3. Any target minimum GPU / fallback if WebGL2 is unavailable?
+3. Should the effects path get FXAA to replace the MSAA it gives up (see performance note), or is the direct-path quality difference acceptable?
+4. Confirm the effect ranges — glow max (bloom strength 1.25), movement amplitude, colour 0–200% — and whether effect settings should persist across sessions.
+5. Any target minimum GPU / fallback if WebGL2 is unavailable?
 4. Is estimated BPM a real requirement or a nice-to-have readout?
 5. For the "textured" sphere — procedural texture (current) or support user-supplied image/video textures later?
 6. Should mic on/off (and chosen preset) be remembered across reloads?

@@ -28,13 +28,20 @@
     </div>
 
     <div class="grp">
-      <div class="eyebrow"><span>View</span><span>scroll · ± · 0</span></div>
+      <div class="eyebrow"><span>View</span><span>drag · scroll · 0</span></div>
       <div class="zoomrow">
         <button class="zbtn" id="zoomOut" aria-label="Zoom out">–</button>
         <div class="zval" id="zoomVal">100%</div>
         <button class="zbtn" id="zoomIn" aria-label="Zoom in">+</button>
         <button class="zreset" id="zoomReset">Reset</button>
       </div>
+    </div>
+
+    <div class="grp">
+      <div class="eyebrow"><span>Effects</span><span>global</span></div>
+      <div class="knob-row"><span>Glow</span><input type="range" id="glow" min="0" max="100" value="0"><span class="kv" id="glowVal">Off</span></div>
+      <div class="knob-row" style="margin-top:16px"><span>Move</span><input type="range" id="move" min="0" max="100" value="0"><span class="kv" id="moveVal">Off</span></div>
+      <div class="knob-row" style="margin-top:16px"><span>Color</span><input type="range" id="colour" min="0" max="200" value="100"><span class="kv" id="colourVal">100%</span></div>
     </div>
 
     <div class="grp">
@@ -60,18 +67,21 @@
           <div class="btxt">Onset pulse<br><span class="bpm" id="bpm">— bpm</span></div>
         </div>
 
-        <div class="knob-row" style="margin-top:18px"><span>Sens</span><input type="range" id="sens" min="10" max="240" value="130"></div>
+        <div class="knob-row" style="margin-top:18px"><span>Sens</span><input type="range" id="sens" min="10" max="240" value="130"><span class="kv" id="sensVal">130%</span></div>
       </div>
     </div>
 
     <div class="footnote">
-      <kbd>H</kbd> panel · <kbd>F</kbd> fullscreen · <kbd>1–7</kbd> presets · <kbd>scroll</kbd>/<kbd>±</kbd>/<kbd>0</kbd> zoom
+      <kbd>H</kbd> panel · <kbd>F</kbd> fullscreen · <kbd>1–7</kbd> presets · <kbd>scroll</kbd>/<kbd>±</kbd> zoom · <kbd>drag</kbd> look around · <kbd>0</kbd> reset view
     </div>
   </aside>
 </div>
 
 <script type="importmap">
-{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
 </script>
 <script type="module" src="app.js"></script>
 </body>

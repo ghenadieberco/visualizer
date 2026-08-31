@@ -1,4 +1,8 @@
 import * as THREE from 'three';
+import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass }      from 'three/addons/postprocessing/ShaderPass.js';
 
 /* =========================================================================
    RENDERER
@@ -6,17 +10,135 @@ import * as THREE from 'three';
 const canvas = document.getElementById('gl');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, powerPreference:'high-performance' });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.setClearColor(0x0b0c10, 1);
+const BG = 0x0b0c10;
+renderer.setClearColor(BG, 1);
 let W = innerWidth, H = innerHeight;
 function sizeRenderer(){ W = innerWidth; H = innerHeight; renderer.setSize(W, H); }
 sizeRenderer();
 
-// global view state shared by all presets
-const state = { zoom: 1 };
+// global view + effect state shared by all presets
+//   zoom     camera zoom (0.3 - 6)
+//   glow     bloom amount, 0 = off (post-pass bypassed entirely)
+//   movement extra random drift on top of the preset's own motion, 0 = off
+//   colour   saturation + brightness multiplier, 1 = the preset's own look
+//   orbit    look direction from dragging the viewport (pitch, yaw in radians)
+const state = { zoom: 1, glow: 0, movement: 0, colour: 1, orbit:{ x:0, y:0 } };
 
 // respect the OS "reduce motion" accessibility setting → damp motion + pulses
 const REDUCED_MOTION = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const MOTION = REDUCED_MOTION ? 0.5 : 1;
+
+/* =========================================================================
+   POST-PROCESSING  —  Glow (bloom) and Color (saturation + brightness).
+   While both sit at their defaults the composer is skipped entirely and the
+   scene renders straight to the canvas, so an untouched panel costs nothing
+   and looks exactly as it always has.
+   ========================================================================= */
+// The slider drives strength, threshold and radius together. Strength alone
+// reads as on/off: a fixed threshold means every bright pixel blooms the moment
+// the slider leaves zero, and the halo just clips harder after that. Sweeping
+// the threshold down as well means low settings glow only the hottest cores and
+// high settings pull progressively more of the image into the halo, so the
+// travel between 10% and 100% is something you can actually see.
+const GLOW_MAX = 1.45;                      // bloom strength at slider 100%
+const glowStrength = t => GLOW_MAX * Math.pow(t, 1.75);
+const glowThreshold = t => 0.85 - 0.60*t;   // 0.85 (hottest cores only) -> 0.25
+// UnrealBloomPass's radius is what mixes its five mips from "favour the sharpest"
+// toward "favour the widest": push it high and a strong glow becomes a haze over
+// the whole frame rather than a halo on what is bright. Kept short of that.
+const glowRadius    = t => 0.25 + 0.40*t;
+const dpr = renderer.getPixelRatio();
+// HalfFloat so additive highlights can exceed 1.0 and actually feed the bloom.
+// No MSAA: resolving a multisampled half-float target every frame cost more
+// than the rest of the post chain put together (~2.5x the whole frame), and the
+// effects are only ever on top of a scene that is mostly glowing thin lines.
+const fxTarget = new THREE.WebGLRenderTarget(W*dpr, H*dpr, { type:THREE.HalfFloatType, samples:0 });
+const composer = new EffectComposer(renderer, fxTarget);
+const renderPass = new RenderPass(null, null);            // scene/camera swapped in per frame
+
+// Colour intensity: one slider for overall punch. Saturation pivots around the
+// pixel's own luminance and brightness scales on top, so 0 is washed out and
+// dark, 100 is the preset as authored, 200 is vivid and hot.
+// This pass also performs the linear -> sRGB output encode. Keeping the two
+// together saves a full-resolution pass over three's separate OutputPass, which
+// matters because every pass here reads and writes the whole frame — and being
+// last in the chain, it is the only pass allowed to encode.
+const gradePass = new ShaderPass({
+  uniforms: { tDiffuse:{value:null}, uSat:{value:1}, uBright:{value:1} },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform float uSat, uBright; varying vec2 vUv;
+    const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);         // Rec.709, linear space
+    void main(){
+      vec4 t = texture2D(tDiffuse, vUv);
+      vec3 c = max(mix(vec3(dot(t.rgb, LUMA)), t.rgb, uSat) * uBright, 0.0);
+      // same transfer function three applies on a direct render, so glow off /
+      // glow on differ only by the effect itself
+      c = mix(pow(c, vec3(0.41666))*1.055 - 0.055, c*12.92, vec3(lessThanEqual(c, vec3(0.0031308))));
+      gl_FragColor = vec4(c, t.a);
+    }`
+});
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(W, H), 0, 0.45, 0.5);
+bloomPass.enabled = false;
+composer.addPass(renderPass);
+composer.addPass(bloomPass);
+composer.addPass(gradePass);                // last: grades and encodes to sRGB
+function sizeComposer(){
+  composer.setSize(W, H);
+  // Full drawing-buffer resolution for the bloom's mip chain: halving it is
+  // cheaper, but on a thin bright trace the halo visibly bands and washes much
+  // wider than it should, which is the opposite of what the glow is for. Only
+  // very large buffers (4K, or HiDPI above 1440p) step down, and at that pixel
+  // density the softer chain is far harder to see than the cost of a full one.
+  const px = W*dpr * H*dpr, scale = px > 2.6e6 ? 0.7 : 1;
+  bloomPass.setSize(W*dpr*scale, H*dpr*scale);
+}
+sizeComposer();
+// true while any post pass has something to do; otherwise the scene goes
+// straight to the canvas exactly as it did before the panel grew an Effects group
+let fxActive = false;
+function refreshFx(){
+  bloomPass.enabled = state.glow > 0;
+  fxActive = bloomPass.enabled || state.colour !== 1;
+}
+
+/* =========================================================================
+   MOVEMENT  —  a slow random drift laid over whatever the preset animates.
+   Six channels (rotation xyz + sway xyz) random-walk toward fresh targets and
+   are eased toward them, so the extra motion reads as a wander, never a jump.
+   Targets are re-rolled on a timer and kicked on strong onsets. Both the
+   amplitude and the drift rate scale with the slider: 0 is perfectly still,
+   100 is a wide, restless orbit.
+   ========================================================================= */
+const MOVE_ROT = [0.30, 0.46, 0.22];        // max yaw/pitch/roll (radians) at 100%
+const MOVE_SWAY = 0.07;                     // max sway as a fraction of camera distance
+const wander = { cur:new Float32Array(6), tgt:new Float32Array(6), next:0, prevBeat:0 };
+function reroll(){
+  for(let i=0;i<6;i++) wander.tgt[i] = Math.random()*2 - 1;
+  wander.next = 1.8 + Math.random()*3.4;    // seconds until the next re-roll
+}
+reroll();
+function updateWander(dt, A){
+  const amt = state.movement;
+  wander.next -= dt * (0.6 + amt*0.9);
+  const kick = A.beat > 0.7 && wander.prevBeat <= 0.7;   // rising edge only
+  wander.prevBeat = A.beat;
+  if(wander.next <= 0 || kick) reroll();
+  const rate = ease(dt, 0.35 + amt*0.85);
+  for(let i=0;i<6;i++) wander.cur[i] += (wander.tgt[i] - wander.cur[i]) * rate;
+}
+// The drag orbit and the movement drift are summed into the scene root, which no
+// preset touches, so both compose with the preset's own camera/group motion
+// instead of fighting it. The root is fully reassigned every frame, so nothing
+// accumulates and a slider at 0 leaves the preset exactly as authored.
+function applyView(p){
+  const a = state.movement * MOTION, c = wander.cur, o = state.orbit;
+  p.scene.rotation.set(o.x + c[0]*MOVE_ROT[0]*a, o.y + c[1]*MOVE_ROT[1]*a, c[2]*MOVE_ROT[2]*a);
+  // sway is scaled by how far the camera sits from the origin, so one slider
+  // reads the same across presets whose worlds differ in size by 100x
+  const k = Math.max(p.camera.position.length(), 0.5) * MOVE_SWAY * a;
+  p.scene.position.set(c[3]*k, c[4]*k, c[5]*k);
+}
 
 /* =========================================================================
    AUDIO ENGINE  —  dB level + FFT bands + spectral-flux onset detection
@@ -806,6 +928,7 @@ function makeSphere(){
   });
 }
 makeTunnel(); makeRadial(); makeTerrain(); makeWaveform(); makeStarfield(); makeSilk(); makeSphere();
+presets.forEach(p => p.scene.background = new THREE.Color(BG));
 
 /* =========================================================================
    PRESET SWITCHING + RENDER LOOP
@@ -821,10 +944,19 @@ function loop(){
   requestAnimationFrame(loop);
   const dt = Math.min(clock.getDelta(), 0.05);
   analyse(dt);
-  presets[active].update(dt, Audio);
-  const cam = presets[active].camera;
-  cam.zoom = state.zoom; cam.updateProjectionMatrix();   // composes with per-preset camera motion
-  renderer.render(presets[active].scene, presets[active].camera);
+  const p = presets[active];
+  p.update(dt, Audio);
+  p.camera.zoom = state.zoom; p.camera.updateProjectionMatrix();   // composes with per-preset camera motion
+  updateWander(dt, Audio);
+  applyView(p);
+  if(fxActive){
+    // glow swells a little on onsets, like every other parameter here
+    if(bloomPass.enabled) bloomPass.strength = glowStrength(state.glow) * (1 + Audio.beat*0.25*MOTION);
+    renderPass.scene = p.scene; renderPass.camera = p.camera;
+    composer.render();
+  } else {
+    renderer.render(p.scene, p.camera);
+  }
   updateMeters();
 }
 // NOTE: loop() is started at the very end, after all DOM refs + UI wiring exist.
@@ -895,7 +1027,36 @@ micBtn.onclick=()=>{
 };
 
 // sensitivity
-document.getElementById('sens').oninput=e=>{ Audio.sensitivity=e.target.value/100; };
+const sensVal=document.getElementById('sensVal');
+document.getElementById('sens').oninput=e=>{
+  Audio.sensitivity=e.target.value/100;
+  sensVal.textContent=e.target.value+'%';
+};
+
+// effects — glow (bloom), movement (random drift) and colour (saturation + brightness)
+const glowVal=document.getElementById('glowVal'), moveVal=document.getElementById('moveVal'), colourVal=document.getElementById('colourVal');
+function setGlow(v){
+  state.glow = v/100;
+  bloomPass.threshold = glowThreshold(state.glow);
+  bloomPass.radius    = glowRadius(state.glow);
+  glowVal.textContent = v>0 ? v+'%' : 'Off';
+  refreshFx();
+}
+function setColour(v){
+  state.colour = v/100;                        // 0 - 2, 1 = the preset's own look
+  gradePass.uniforms.uSat.value = state.colour;
+  gradePass.uniforms.uBright.value = 0.40 + 0.60*state.colour;
+  colourVal.textContent = v+'%';
+  refreshFx();
+}
+function setMovement(v){
+  state.movement = v/100;
+  moveVal.textContent = v>0 ? v+'%' : 'Off';
+}
+document.getElementById('glow').oninput=e=>setGlow(+e.target.value);
+document.getElementById('move').oninput=e=>setMovement(+e.target.value);
+document.getElementById('colour').oninput=e=>setColour(+e.target.value);
+
 
 // zoom / view controls
 const zoomVal=document.getElementById('zoomVal');
@@ -903,8 +1064,33 @@ function setZoom(z){ state.zoom=THREE.MathUtils.clamp(z,0.3,6); zoomVal.textCont
 function zoomBy(f){ setZoom(state.zoom*f); }
 document.getElementById('zoomIn').onclick=()=>zoomBy(1.15);
 document.getElementById('zoomOut').onclick=()=>zoomBy(1/1.15);
-document.getElementById('zoomReset').onclick=()=>setZoom(1);
+document.getElementById('zoomReset').onclick=()=>{ setZoom(1); resetView(); };
 canvas.addEventListener('wheel',e=>{ e.preventDefault(); zoomBy(Math.exp(-e.deltaY*0.0015)); },{passive:false});
+
+// drag the viewport to look around. Pitch is clamped short of straight up/down
+// so the scene can never end up upside down with no way back.
+const ORBIT_SPEED = 0.005, ORBIT_PITCH = 1.2;
+let drag = null;
+function resetView(){ state.orbit.x = state.orbit.y = 0; }
+canvas.addEventListener('pointerdown',e=>{
+  if(e.button !== 0) return;
+  drag = { x:e.clientX, y:e.clientY };
+  canvas.setPointerCapture(e.pointerId);
+  canvas.classList.add('dragging');
+});
+canvas.addEventListener('pointermove',e=>{
+  if(!drag) return;
+  state.orbit.y += (e.clientX - drag.x) * ORBIT_SPEED;
+  state.orbit.x = THREE.MathUtils.clamp(state.orbit.x + (e.clientY - drag.y) * ORBIT_SPEED, -ORBIT_PITCH, ORBIT_PITCH);
+  drag.x = e.clientX; drag.y = e.clientY;
+});
+for(const ev of ['pointerup','pointercancel']) canvas.addEventListener(ev,e=>{
+  if(!drag) return;
+  drag = null;
+  try { canvas.releasePointerCapture(e.pointerId); } catch(err){}
+  canvas.classList.remove('dragging');
+});
+canvas.addEventListener('dblclick',resetView);
 
 // meters
 const vuFill=document.getElementById('vuFill'), vuPeak=document.getElementById('vuPeak'), dbVal=document.getElementById('dbVal');
@@ -934,11 +1120,11 @@ addEventListener('keydown',e=>{
   else if(e.key==='ArrowLeft') selectPreset(active-1);
   else if(e.key==='+'||e.key==='=') zoomBy(1.15);
   else if(e.key==='-'||e.key==='_') zoomBy(1/1.15);
-  else if(e.key==='0') setZoom(1);
+  else if(e.key==='0'){ setZoom(1); resetView(); }
 });
 
 // resize
-addEventListener('resize',()=>{ sizeRenderer(); presets.forEach(p=>p.resize()); });
+addEventListener('resize',()=>{ sizeRenderer(); sizeComposer(); presets.forEach(p=>p.resize()); });
 
 // request microphone and start listening on first load
 startMic();

@@ -34,6 +34,11 @@ body {
   width: 100%;
   height: 100%;
   display: block;
+  cursor: grab;
+  touch-action: none;
+}
+#gl.dragging {
+  cursor: grabbing;
 }
 
 /* ---- top bar ---- */
@@ -405,8 +410,18 @@ input[type="range"]:focus-visible {
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
-.knob-row span {
-  min-width: 26px;
+.knob-row > span:first-child {
+  flex: none;
+  min-width: 42px;
+}
+
+.knob-row .kv {
+  flex: none;
+  min-width: 42px;
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
 }
 
 .micbtn {
