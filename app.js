@@ -3,6 +3,7 @@ import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass }      from 'three/addons/postprocessing/ShaderPass.js';
+import { Pass }            from 'three/addons/postprocessing/Pass.js';
 
 /* =========================================================================
    RENDERER
@@ -22,9 +23,11 @@ sizeRenderer();
 //   movement extra random drift on top of the preset's own motion, 0 = off
 //   colour   saturation + brightness multiplier, 1 = the preset's own look
 //   orbit    look direction from dragging the viewport (pitch, yaw in radians)
-//   text     overlay caption: its lines, screen size in px, and font stack key
+//   text     overlay caption: its lines, screen size in px, font stack key,
+//            fill colour, and its own glow — deliberately separate from `glow`
 const state = { zoom: 1, glow: 0, movement: 0, colour: 1, orbit:{ x:0, y:0 },
-                text: '', textSize: 72, textFont: 'sans' };
+                text: '', textSize: 72, textFont: 'sans',
+                textColour: '#ffffff', textGlow: 0 };
 
 // respect the OS "reduce motion" accessibility setting → damp motion + pulses
 const REDUCED_MOTION = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -84,6 +87,9 @@ const bloomPass = new UnrealBloomPass(new THREE.Vector2(W, H), 0, 0.45, 0.5);
 bloomPass.enabled = false;
 composer.addPass(renderPass);
 composer.addPass(bloomPass);
+// The text overlay inserts itself here (see TEXT OVERLAY): after the bloom, so
+// the global Glow can never reach the caption, and before the grade, so Color
+// still applies to it along with everything else.
 composer.addPass(gradePass);                // last: grades and encodes to sRGB
 function sizeComposer(){
   composer.setSize(W, H);
@@ -1120,15 +1126,24 @@ function makeGlitch(){
 makeTunnel(); makeRadial(); makeTerrain(); makeWaveform(); makeStarfield(); makeSilk(); makeSphere(); makeGlitch();
 
 /* =========================================================================
-   TEXT OVERLAY  —  a caption held in front of the camera, dead centre.
-   It hangs off the camera rather than the scene, so it stays centred and
-   upright however the preset moves, however far the view is dragged and
-   however hard Movement is pushed. It is still inside the rendered scene, so
-   Glow and Color grade it along with everything else.
+   TEXT OVERLAY  —  a caption drawn dead centre, over the finished frame.
+   It lives in a screen-space scene of its own rather than inside a preset, for
+   one reason: the global Glow must not touch it. The overlay is composited
+   after the bloom pass and carries its own, independent glow — drawn into the
+   glyphs rather than post-processed — while Color, which comes after, still
+   grades it along with everything else.
    ========================================================================= */
-const TEXT_DIST = 2;                   // metres in front of the camera
 const TEXT_SS = 2;                     // supersample factor for crisp glyphs
 const TEXT_SWELL = 0.35;               // extra size at full level, on top of the slider
+// Text Glow is painted, not post-processed: the caption is drawn a second time
+// into a companion canvas through a canvas-2D shadow, and that halo is laid
+// under the glyphs additively. Radius and opacity both ramp with the slider, so
+// low settings read as a tight rim and high settings as a wide corona. Keeping
+// the halo on its own quad means its intensity can pulse every frame without
+// anything being redrawn.
+const textGlowBlur  = t => 0.08 + 0.42*t;   // shadow radius, as a fraction of the font size
+const textGlowAlpha = t => 0.35 + 0.65*t;   // opacity of the halo quad
+const TEXT_GLOW_PASSES = 3;            // stacked shadow draws; one alone is too thin to read
 // System font stacks — nothing is downloaded, so the caption draws on the first
 // frame. Display carries a weight as well as a family: the heavy faces it asks
 // for are missing on plenty of machines, and without the 900 it would fall back
@@ -1140,42 +1155,82 @@ const FONTS = {
   display:   { weight:900, stack:'"Arial Black", Impact, Haettenschweiler, system-ui, sans-serif' },
   condensed: { weight:400, stack:'"Arial Narrow", "Helvetica Neue Condensed", "Liberation Sans Narrow", system-ui, sans-serif' }
 };
-const textCanvas = document.createElement('canvas');
-const tctx = textCanvas.getContext('2d');
-const textTex = new THREE.CanvasTexture(textCanvas);
-textTex.colorSpace = THREE.SRGBColorSpace;    // the 2D canvas hands back sRGB
-textTex.generateMipmaps = false;              // drawn ~1:1 on screen
-textTex.minFilter = THREE.LinearFilter;
+const textCanvas = document.createElement('canvas'), tctx = textCanvas.getContext('2d');
+const glowCanvas = document.createElement('canvas'), gctx = glowCanvas.getContext('2d');
+function makeTextTex(cv){
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;        // the 2D canvas hands back sRGB
+  t.generateMipmaps = false;                  // drawn ~1:1 on screen
+  t.minFilter = THREE.LinearFilter;
+  return t;
+}
+const textTex = makeTextTex(textCanvas), glowTex = makeTextTex(glowCanvas);
 const textMat = new THREE.MeshBasicMaterial({
   map: textTex, transparent: true, depthTest: false, depthWrite: false, fog: false
+});
+// Additive, so the halo lifts whatever is behind it instead of veiling it —
+// the same trick the Waveform preset uses for its glow, and the reason this
+// caption needs no bloom of its own.
+const glowMat = new THREE.MeshBasicMaterial({
+  map: glowTex, transparent: true, depthTest: false, depthWrite: false, fog: false,
+  blending: THREE.AdditiveBlending, opacity: 0
 });
 const textGeo = new THREE.PlaneGeometry(1, 1);
 let textW = 0, textH = 0;                     // rendered size in CSS pixels
 let textSwell = 1;                            // eased level-driven size multiplier
 
+// The overlay scene: an orthographic camera spanning the viewport in CSS
+// pixels, so the size control is simply the quad's height in world units and
+// nothing has to be re-derived from the active preset's field of view or zoom.
+const textScene = new THREE.Scene();
+const textCam = new THREE.OrthographicCamera(-W/2, W/2, H/2, -H/2, -1, 1);
+function sizeTextCam(){
+  textCam.left = -W/2; textCam.right = W/2; textCam.top = H/2; textCam.bottom = -H/2;
+  textCam.updateProjectionMatrix();
+}
+const glowQuad = new THREE.Mesh(textGeo, glowMat);
+const textQuad = new THREE.Mesh(textGeo, textMat);
+glowQuad.renderOrder = 0; textQuad.renderOrder = 1;   // halo first, glyphs over it
+glowQuad.visible = textQuad.visible = false;
+textScene.add(glowQuad, textQuad);
+
+// Composited straight into whatever the chain holds so far, so the caption is
+// laid over the bloomed frame rather than fed into the bloom. `needsSwap` is
+// false because nothing is copied: the overlay draws into the read buffer and
+// the next pass reads it back.
+class OverlayPass extends Pass {
+  constructor(scene, camera){ super(); this.scene = scene; this.camera = camera; this.needsSwap = false; }
+  render(renderer, writeBuffer, readBuffer){
+    const auto = renderer.autoClear;
+    renderer.autoClear = false;               // draw on top; never wipe the frame
+    renderer.setRenderTarget(this.renderToScreen ? null : readBuffer);
+    renderer.render(this.scene, this.camera);
+    renderer.autoClear = auto;
+  }
+}
+const overlayPass = new OverlayPass(textScene, textCam);
+overlayPass.enabled = false;                  // nothing to draw until there is a caption
+composer.insertPass(overlayPass, composer.passes.indexOf(gradePass));
+
 // Every preset gets a content root holding what it draws, so the view transform
-// (drag + Movement) can turn the scene without turning the camera — which now
-// lives in the scene too, carrying the text quad with it.
+// (drag + Movement) can turn the scene without turning the camera.
 presets.forEach(p => {
   p.scene.background = new THREE.Color(BG);
   const root = new THREE.Group();
   while (p.scene.children.length) root.add(p.scene.children[0]);
-  p.scene.add(root, p.camera);
+  p.scene.add(root);
   p.root = root;
-  const quad = new THREE.Mesh(textGeo, textMat);
-  quad.position.z = -TEXT_DIST;
-  quad.renderOrder = 999;                     // last, over everything
-  quad.visible = false;
-  p.camera.add(quad);
-  p.textQuad = quad;
 });
 
-// Redraw the caption into its canvas. Canvas 2D resets its state whenever the
+// Redraw the caption into its canvases. Canvas 2D resets its state whenever the
 // element is resized, so the font is measured, the canvas sized, then set again.
 function drawText(){
   const lines = state.text.split('\n');
   const has = state.text.trim().length > 0;
-  presets.forEach(p => p.textQuad.visible = has);
+  const glowOn = has && state.textGlow > 0;
+  textQuad.visible = has;
+  glowQuad.visible = glowOn;
+  overlayPass.enabled = has;
   if(!has) return;
   const px = state.textSize * TEXT_SS;
   const f = FONTS[state.textFont] || FONTS.sans;
@@ -1183,7 +1238,10 @@ function drawText(){
   tctx.font = font;
   let w = 0;
   for(const line of lines) w = Math.max(w, tctx.measureText(line).width);
-  const lh = px*1.28, padX = px*0.35, padY = px*0.30;
+  // The halo needs room or it is cut off at the canvas edge: a canvas shadow of
+  // radius b has faded to nothing by roughly 1.3b, so that is the extra margin.
+  const blur = glowOn ? px*textGlowBlur(state.textGlow) : 0;
+  const lh = px*1.28, padX = px*0.35 + blur*1.3, padY = px*0.30 + blur*1.3;
   const cw = Math.max(Math.min(Math.ceil(w + padX*2), 4096), 2);
   const ch = Math.max(Math.min(Math.ceil(lines.length*lh + padY*2), 4096), 2);
   if(textCanvas.width !== cw || textCanvas.height !== ch){
@@ -1191,31 +1249,52 @@ function drawText(){
     // so once the caption grows — every keystroke does — the new canvas would be
     // pushed into the old, smaller allocation and come back as garbage. Dropping
     // the texture makes three allocate again at the size actually being drawn.
-    textTex.dispose();
+    textTex.dispose(); glowTex.dispose();
     textCanvas.width = cw; textCanvas.height = ch;
+    glowCanvas.width = cw; glowCanvas.height = ch;
   }
+  // Both canvases are the same size and take the same strokes, so the halo sits
+  // exactly under the glyphs however the two quads are scaled.
+  const paint = ctx => {
+    ctx.font = font;                          // canvas state is reset by a resize
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = state.textColour;
+    for(let i=0;i<lines.length;i++) ctx.fillText(lines[i], cw/2, padY + lh*(i + 0.5));
+  };
   tctx.clearRect(0, 0, cw, ch);                // resizing clears; same size does not
-  tctx.font = font;                           // canvas state is reset by a resize
-  tctx.textAlign = 'center'; tctx.textBaseline = 'middle';
-  tctx.fillStyle = '#ffffff';
-  for(let i=0;i<lines.length;i++) tctx.fillText(lines[i], cw/2, padY + lh*(i + 0.5));
+  paint(tctx);
   textTex.needsUpdate = true;
+  gctx.clearRect(0, 0, cw, ch);
+  if(glowOn){
+    gctx.shadowColor = state.textColour;       // the halo takes the caption's own colour
+    gctx.shadowBlur = blur;
+    for(let i=0;i<TEXT_GLOW_PASSES;i++) paint(gctx);
+    gctx.shadowBlur = 0;
+  }
+  glowTex.needsUpdate = true;
   textW = cw/TEXT_SS; textH = ch/TEXT_SS;
 }
+// A redraw is the expensive part of any text control — the glow especially —
+// and a slider drag or a held key fires several input events per frame, so they
+// are coalesced into one redraw at the top of the next frame.
+let textDirty = false;
+const queueText = () => { textDirty = true; };
 
-// Size the quad so the caption covers exactly the pixels the slider asks for,
-// whatever the preset's field of view and whatever the zoom is doing — then
-// swell it with the level. The slider size is the resting size, at silence;
-// louder pushes it up to +35%. `A.level` is already attack/release smoothed, and
-// this eases on top of it, so the caption breathes with the signal instead of
-// chattering on every frame. Damped, like every other pulse, under reduce-motion.
-function fitText(p, dt, A){
+// Size the quads so the caption covers exactly the pixels the slider asks for —
+// then swell it with the level. The slider size is the resting size, at
+// silence; louder pushes it up to +35%. `A.level` is already attack/release
+// smoothed, and this eases on top of it, so the caption breathes with the
+// signal instead of chattering on every frame. Damped, like every other pulse,
+// under reduce-motion.
+function fitText(dt, A){
   textSwell += ((1 + A.level*TEXT_SWELL*MOTION) - textSwell) * ease(dt, 7);
-  const quad = p.textQuad, cam = p.camera;
-  if(!quad.visible || !cam.isPerspectiveCamera) return;
-  const viewH = 2*TEXT_DIST*Math.tan(cam.fov*Math.PI/360) / Math.max(cam.zoom, 1e-4);
-  const perPx = viewH / H * textSwell;
-  quad.scale.set(textW*perPx, textH*perPx, 1);
+  if(!textQuad.visible) return;
+  const w = textW*textSwell, h = textH*textSwell;
+  textQuad.scale.set(w, h, 1);
+  glowQuad.scale.set(w, h, 1);
+  // the halo swells on onsets, as the global glow does — its own reactivity,
+  // driven by the text slider alone
+  if(glowQuad.visible) glowMat.opacity = textGlowAlpha(state.textGlow) * (1 + A.beat*0.25*MOTION);
 }
 
 /* =========================================================================
@@ -1237,7 +1316,8 @@ function loop(){
   p.camera.zoom = state.zoom; p.camera.updateProjectionMatrix();   // composes with per-preset camera motion
   updateWander(dt, Audio);
   applyView(p);
-  fitText(p, dt, Audio);
+  if(textDirty){ textDirty = false; drawText(); }
+  fitText(dt, Audio);
   if(fxActive){
     // glow swells a little on onsets, like every other parameter here
     if(bloomPass.enabled) bloomPass.strength = glowStrength(state.glow) * (1 + Audio.beat*0.25*MOTION);
@@ -1245,6 +1325,13 @@ function loop(){
     composer.render();
   } else {
     renderer.render(p.scene, p.camera);
+    // with the post chain bypassed the overlay pass never runs, so the caption
+    // is laid over the finished frame here instead — the same composite
+    if(textQuad.visible){
+      renderer.autoClear = false;
+      renderer.render(textScene, textCam);
+      renderer.autoClear = true;
+    }
   }
   updateMeters();
 }
@@ -1346,20 +1433,33 @@ document.getElementById('glow').oninput=e=>setGlow(+e.target.value);
 document.getElementById('move').oninput=e=>setMovement(+e.target.value);
 document.getElementById('colour').oninput=e=>setColour(+e.target.value);
 
-// text overlay — content, screen size, font
+// text overlay — content, screen size, font, fill colour and its own glow
 const textInput=document.getElementById('textInput'), textHint=document.getElementById('textHint'),
-      textSizeVal=document.getElementById('textSizeVal');
+      textSizeVal=document.getElementById('textSizeVal'),
+      textColourVal=document.getElementById('textColourVal'), textGlowVal=document.getElementById('textGlowVal');
 function refreshTextHint(){
   const n = state.text.trim() ? state.text.split('\n').length : 0;
   textHint.textContent = n ? (n===1 ? '1 line' : n+' lines') : 'Off';
 }
-textInput.oninput=e=>{ state.text = e.target.value; drawText(); refreshTextHint(); };
+textInput.oninput=e=>{ state.text = e.target.value; queueText(); refreshTextHint(); };
 document.getElementById('textSize').oninput=e=>{
   state.textSize = +e.target.value;
   textSizeVal.textContent = state.textSize + 'px';
-  drawText();
+  queueText();
 };
-document.getElementById('textFont').onchange=e=>{ state.textFont = e.target.value; drawText(); };
+document.getElementById('textFont').onchange=e=>{ state.textFont = e.target.value; queueText(); };
+document.getElementById('textColour').oninput=e=>{
+  state.textColour = e.target.value;            // colours the glyphs and their halo
+  textColourVal.textContent = state.textColour.toUpperCase();
+  queueText();
+};
+// deliberately not wired to the Effects group: this glow is the caption's alone
+document.getElementById('textGlow').oninput=e=>{
+  const v = +e.target.value;
+  state.textGlow = v/100;
+  textGlowVal.textContent = v>0 ? v+'%' : 'Off';
+  queueText();
+};
 
 
 // zoom / view controls
@@ -1428,7 +1528,7 @@ addEventListener('keydown',e=>{
 });
 
 // resize
-addEventListener('resize',()=>{ sizeRenderer(); sizeComposer(); presets.forEach(p=>p.resize()); });
+addEventListener('resize',()=>{ sizeRenderer(); sizeComposer(); sizeTextCam(); presets.forEach(p=>p.resize()); });
 
 // request microphone and start listening on first load
 startMic();

@@ -1,9 +1,10 @@
 # Visualizer — Requirements
 
-**Version:** 0.10 (draft) · **Date:** 2026-09-01 · **Status:** For review
+**Version:** 0.11 (draft) · **Date:** 2026-09-01 · **Status:** For review
 
 A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders one of several fixed presets, animated in real time from the microphone signal. A collapsible right-hand panel selects presets and controls the view and the mic.
 
+> **Changes since 0.10:** the **Text** overlay gained its own **colour** and its own **glow**, and was lifted out of the preset scene so the global Glow no longer reaches it.
 > **Changes since 0.9:** added the **Glitch** preset — a corrupted video panel of spectrum-driven data cells, torn into sliding slices with RGB channel separation, a rolling sync bar and screen-space scanlines, bringing the set to eight.
 > **Changes since 0.8:** added a **Text** overlay — a caption held in front of the camera, dead centre, with size and system-font controls.
 > **Changes since 0.7:** added a global **Effects** panel group — Glow (bloom), Move (random drift) and Color (saturation + brightness) — and **drag-to-look** in the viewport. Presets stay fixed; these compose on top of them.
@@ -44,7 +45,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 | Startup | Request mic permission and begin listening on first page load |
 | Zoom | Global zoom across all presets via scroll, buttons, and keys |
 | Effects | Global glow, movement and colour intensity, layered over any preset |
-| Text | Optional caption centred in front of the camera, with size and font controls |
+| Text | Optional caption centred over the scene, with size, font, colour and its own glow |
 | Camera | Drag to look around; composes with zoom and each preset's own motion |
 | Target platform | Desktop browsers only |
 | Preset set | spectrum tunnel · radial spectrum burst · frequency terrain · waveform · starfield warp · liquid waves · sphere · glitch |
@@ -73,18 +74,20 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 
 Three controls in a panel **Effects** group, applied to whichever preset is active and persisting across preset switches. Each is inert at its default, so a fresh load looks exactly as it did before the group existed.
 
-- **FR-7c Glow** (0–100%, default 0) drives a bloom post-pass. The slider moves strength, luminance threshold and radius together — low settings halo only the hottest cores, high settings pull progressively more of the image into the glow — so the travel across the slider is visible rather than on/off. It glows what the preset draws and must not lift the background. Onsets swell it slightly.
+- **FR-7c Glow** (0–100%, default 0) drives a bloom post-pass. The slider moves strength, luminance threshold and radius together — low settings halo only the hottest cores, high settings pull progressively more of the image into the glow — so the travel across the slider is visible rather than on/off. It glows what the preset draws and must not lift the background. Onsets swell it slightly. It applies to the **preset only**: the text overlay is composited after it and carries its own glow instead (FR-7n).
 - **FR-7d Movement** (0–100%, default 0) adds a slow random drift — rotation plus sway — on top of whatever the preset already animates. Amplitude and drift rate both scale with the slider, so it reads as motion *intensity*. Targets are re-rolled on a timer and kicked on strong onsets; sway is scaled by camera distance so one slider reads the same across presets of very different world sizes. Damped by `prefers-reduced-motion` (NFR-8).
-- **FR-7e Color** (0–200%, default 100%) scales saturation and brightness together: 0 is desaturated and dark, 100% is the preset as authored, 200% is vivid and hot.
+- **FR-7e Color** (0–200%, default 100%) scales saturation and brightness together: 0 is desaturated and dark, 100% is the preset as authored, 200% is vivid and hot. Unlike Glow, it grades the whole frame, text overlay included.
 
 ### 3.2b Text overlay
 
-- **FR-7g** A panel textarea sets an overlay caption. It renders **dead centre, in front of the camera**, in white, over everything the preset draws. Empty input renders nothing.
+- **FR-7g** A panel textarea sets an overlay caption. It renders **dead centre**, over everything the preset draws. Empty input renders nothing.
 - **FR-7h** Newlines in the textarea become separate centred lines.
 - **FR-7i** A size control sets the caption's height in screen pixels (12–200, default 72), holding that size whatever the preset's field of view and whatever zoom is set to.
 - **FR-7i.1** The caption **scales with the dB level**: the slider size is its resting size at silence, and level swells it smoothly to +35% at full scale. The swell is eased on top of the already attack/release-smoothed level, so it breathes with the signal rather than chattering, and is damped under reduce-motion (NFR-8).
 - **FR-7j** A font selector offers five **system** font stacks — sans, serif, mono, display, condensed — so nothing is downloaded and the caption draws on the first frame.
-- **FR-7k** The caption keeps its position and orientation through zoom, drag-to-look and Movement, and is graded and bloomed by the Color and Glow effects along with the rest of the scene.
+- **FR-7k** The caption keeps its position and orientation through zoom, drag-to-look and Movement, and is graded by the Color effect along with the rest of the frame. It is **not** bloomed by the global Glow (FR-7c) — that control belongs to the preset, and the caption has its own (FR-7n).
+- **FR-7m Color** — a colour picker sets the caption's fill (default `#ffffff`), with the chosen value shown as hex beside it. It colours the glyphs and their glow together.
+- **FR-7n Glow** (0–100%, default 0) haloes the caption alone, independent of the global Glow and inert at 0. Radius and intensity both ramp with the slider, from a tight rim at low settings to a wide corona at high ones; the halo takes the caption's own colour, sits additively beneath the glyphs, and swells on onsets (damped under reduce-motion, NFR-8).
 - **FR-7l** Typing in the panel never triggers the app's single-key shortcuts.
 
 ### 3.3 Presets
@@ -164,13 +167,15 @@ Three controls in a panel **Effects** group, applied to whichever preset is acti
 - Source layout: `index.html` (markup) · `app.css` · `app.js` (ES module). The module must be served over HTTP; browsers refuse module loads from `file://`.
 - Audio: **Web Audio API** — `AnalyserNode` for FFT and time-domain data; `MediaStreamSource` from `getUserMedia` for the mic (no output node). Autoplay suspension is resolved by resuming the context on the first user gesture.
 - Beat detection: spectral-flux onset with adaptive mean-based threshold, refractory ~110 ms, exponential-decay pulse envelope.
-- Effects: an `EffectComposer` chain — `RenderPass` → `UnrealBloomPass` → colour grade (`ShaderPass`). The composer is bypassed entirely while every effect sits at its default, so the untouched app renders straight to the canvas at no cost; the bloom pass is `enabled = false` until Glow leaves zero.
+- Effects: an `EffectComposer` chain — `RenderPass` → `UnrealBloomPass` → text overlay → colour grade (`ShaderPass`). The composer is bypassed entirely while every effect sits at its default, so the untouched app renders straight to the canvas at no cost; the bloom pass is `enabled = false` until Glow leaves zero. **Chain order is the mechanism behind FR-7k**: the overlay is composited after the bloom (so Glow cannot reach the caption) and before the grade (so Color still does).
 - Effects performance: every pass reads and writes the whole frame, so the chain is kept short. The grade pass also performs the linear → sRGB encode (saving a separate `OutputPass`), and the composer target carries **no MSAA** — resolving a multisampled half-float target every frame cost more than the rest of the chain combined (~3x the frame time). Together these cut the cost of an effect being on by roughly 3x, taking colour intensity to near free.
 - Bloom resolution: the mip chain runs at the full drawing buffer, stepping down to 0.7 only above ~2.6 Mpx (4K, HiDPI over 1440p). Half resolution is cheaper still, but bands the halo on a thin bright trace and spreads it much wider — the frame-wide wash the glow is meant to avoid.
 - Trade-off: with an effect on, edges are aliased where the direct path gets `antialias: true`. FXAA folded into the grade pass is the cheap way back if it proves visible.
 - Render-target colour space: each preset scene sets `scene.background`. Without it, `RenderPass` clears a bound render target with the canvas-space (sRGB) clear value while the buffer is linear, and `OutputPass` then encodes it a second time — greying the whole frame. Naming the background makes three clear it in the working space instead.
 - Scene graph: each preset scene holds a **content root** (everything the preset draws) plus its camera. Drag and Movement are summed into the content root's `rotation`/`position` — reassigned in full every frame, so nothing accumulates — which leaves the camera untouched by them. Movement uses six eased random-walk channels (rotation xyz + sway xyz).
-- Text overlay: redrawn on every keystroke, and the `CanvasTexture` is **disposed whenever the canvas changes size** — GPU storage for a canvas texture is immutable and sized by its first upload, so a growing caption otherwise uploads into the old allocation and renders as garbage. A `PlaneGeometry` quad parented to the **camera** at 2 units, `depthTest: false` and `renderOrder 999`. Being a camera child keeps it centred through every view transform; being inside the scene keeps it in the post chain, so Glow and Color apply to it. Glyphs are drawn into a 2D canvas at 2x supersample and uploaded as a `CanvasTexture` (tagged `SRGBColorSpace`); the quad is rescaled each frame from the active camera's fov and zoom so the size control means screen pixels.
+- Text overlay: a screen-space scene of its own — two `PlaneGeometry` quads (halo, then glyphs) under an orthographic camera spanning the viewport **in CSS pixels**, so the size control is simply the quad's height and nothing has to be re-derived from the active preset's fov or zoom. It is composited by a small custom `Pass` (`needsSwap = false`, `autoClear` off) that draws straight into the composer's read buffer at the slot described above; with the post chain bypassed, the same scene is drawn over the finished frame directly instead.
+- Text glow: painted, not post-processed. The caption is drawn a second time into a companion canvas through a canvas-2D `shadowBlur` in its own colour — stacked three times, since one pass is too thin to read — and laid under the glyphs on an additive quad, the same trick the Waveform preset uses. Canvas padding grows with the shadow radius (~1.3x) or the halo clips at the edge; keeping the halo on its own quad lets its intensity pulse per frame with no redraw. Both canvases share one size, so the two quads stay registered at any scale.
+- Text canvases: redrawn on every keystroke, and both `CanvasTexture`s are **disposed whenever the canvas changes size** — GPU storage for a canvas texture is immutable and sized by its first upload, so a growing caption otherwise uploads into the old allocation and renders as garbage. Glyphs are drawn at 2x supersample and tagged `SRGBColorSpace`. Redraws are coalesced to one per frame: a slider drag fires several input events between frames and the glow is the expensive part of a redraw.
 - Zoom: every preset uses a perspective or orthographic camera, so zoom is applied via the camera's `.zoom` (independent of position, so it composes with each preset's orbit/dolly/fly motion). No full-screen shader remains.
 - Opacity: instanced-mesh presets set `material.opacity`; shader presets multiply a `uOpacity` uniform into output alpha. Both fed from the normalized dB level with a floor.
 - Dependency note: the prototype loads Three.js and its `examples/jsm` post-processing addons from a CDN (via an import map) and needs network access on first load.
