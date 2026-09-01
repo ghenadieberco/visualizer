@@ -692,7 +692,7 @@ function makeSilk(){
         float g2 = pow(max(dot(N, normalize(L2+V)), 0.0), 120.0);
         float a1 = sheen(T, L1, V, 150.0) * lit;                    // narrow ribbon along the folds
         float a2 = sheen(T, L2, V, 70.0);
-        float fres = pow(1.0 - max(dot(N,V), 0.0), 6.0);
+        float fres = pow(max(1.0 - max(dot(N,V), 0.0), 0.0), 6.0);
 
         float glint = 1.0 + uBeat*0.8;                              // onset lifts the shine
         c += vec3(0.85,0.90,1.00) * g1 * 1.10 * glint;
@@ -808,7 +808,9 @@ function makeSphere(){
       vec3 pC = n * (uRadius + h);
       vec3 nT = normalize(n + T*e); vec3 pT = nT * (uRadius + disp(nT));
       vec3 nB = normalize(n + B*e); vec3 pB = nB * (uRadius + disp(nB));
-      vec3 N = normalize(cross(pT - pC, pB - pC));
+      vec3 cr = cross(pT - pC, pB - pC);
+      float cl = length(cr);
+      vec3 N = cl > 1e-9 ? cr/cl : n;           // never normalize a zero vector
 
       vRidge = h / max(uAmp, 0.001);            // normalized so colour keys off shape, not loudness
       vec4 wp = modelMatrix * vec4(pC * uShrink, 1.0);
@@ -831,7 +833,7 @@ function makeSphere(){
         vec3 V = normalize(cameraPosition - vWorld);
         vec3 L = normalize(vec3(0.45, 0.75, 0.55));
         float ndl = max(dot(N,L), 0.0);
-        float fres = pow(1.0 - max(dot(N,V), 0.0), 3.0);
+        float fres = pow(max(1.0 - max(dot(N,V), 0.0), 0.0), 3.0);
         vec3 body = mix(uColA, uColB, clamp(vRidge*0.35 + 0.5, 0.0, 1.0));
         vec3 c = body * (0.030 + 0.075*ndl);                       // just enough to sit above black
         c += body * fres * (0.16 + uLevel*0.30 + uBeat*0.22);      // silhouette rim
@@ -853,7 +855,12 @@ function makeSphere(){
       void main(){
         // fwidth keeps the line a constant width in *pixels*, so the mesh stays
         // legible whether a triangle is facing us or skewed at the silhouette
-        vec3 w = fwidth(vBary);
+        // fwidth() collapses to zero on a triangle that lands edge-on or
+        // covers less than a pixel, and smoothstep with edge0 == edge1 is a
+        // divide by zero. One NaN fragment survives into the bloom's mip chain
+        // and comes back as a black block flickering over the frame, so the
+        // width carries a floor it can never fall below.
+        vec3 w = max(fwidth(vBary), vec3(1e-6));
         vec3 c1 = smoothstep(vec3(0.0), w*1.25, vBary);
         float core = 1.0 - min(min(c1.x,c1.y),c1.z);      // crisp filament
         vec3 c2 = smoothstep(vec3(0.0), w*6.00, vBary);
@@ -861,7 +868,9 @@ function makeSphere(){
         halo *= halo;                                     // bloom, falling off into the face
 
         vec3 V = normalize(cameraPosition - vWorld);
-        float rim = pow(1.0 - abs(dot(normalize(vN), V)), 2.5);   // edges burn at the silhouette
+        // ...and dot() of two normalised vectors can come back a hair over 1,
+        // which would hand pow() a negative base: undefined, and NaN in practice
+        float rim = pow(max(1.0 - abs(dot(normalize(vN), V)), 0.0), 2.5);   // edges burn at the silhouette
         vec3 tint = mix(uColA, uColB, clamp(vRidge*0.35 + 0.5, 0.0, 1.0));
 
         float a = clamp(core + halo*0.38, 0.0, 1.0) * uOpacity;
