@@ -22,7 +22,9 @@ sizeRenderer();
 //   movement extra random drift on top of the preset's own motion, 0 = off
 //   colour   saturation + brightness multiplier, 1 = the preset's own look
 //   orbit    look direction from dragging the viewport (pitch, yaw in radians)
-const state = { zoom: 1, glow: 0, movement: 0, colour: 1, orbit:{ x:0, y:0 } };
+//   text     overlay caption: its lines, screen size in px, and font stack key
+const state = { zoom: 1, glow: 0, movement: 0, colour: 1, orbit:{ x:0, y:0 },
+                text: '', textSize: 72, textFont: 'sans' };
 
 // respect the OS "reduce motion" accessibility setting → damp motion + pulses
 const REDUCED_MOTION = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -127,17 +129,17 @@ function updateWander(dt, A){
   const rate = ease(dt, 0.35 + amt*0.85);
   for(let i=0;i<6;i++) wander.cur[i] += (wander.tgt[i] - wander.cur[i]) * rate;
 }
-// The drag orbit and the movement drift are summed into the scene root, which no
-// preset touches, so both compose with the preset's own camera/group motion
+// The drag orbit and the movement drift are summed into the preset's content
+// root, so both compose with the preset's own camera/group motion
 // instead of fighting it. The root is fully reassigned every frame, so nothing
 // accumulates and a slider at 0 leaves the preset exactly as authored.
 function applyView(p){
   const a = state.movement * MOTION, c = wander.cur, o = state.orbit;
-  p.scene.rotation.set(o.x + c[0]*MOVE_ROT[0]*a, o.y + c[1]*MOVE_ROT[1]*a, c[2]*MOVE_ROT[2]*a);
+  p.root.rotation.set(o.x + c[0]*MOVE_ROT[0]*a, o.y + c[1]*MOVE_ROT[1]*a, c[2]*MOVE_ROT[2]*a);
   // sway is scaled by how far the camera sits from the origin, so one slider
   // reads the same across presets whose worlds differ in size by 100x
   const k = Math.max(p.camera.position.length(), 0.5) * MOVE_SWAY * a;
-  p.scene.position.set(c[3]*k, c[4]*k, c[5]*k);
+  p.root.position.set(c[3]*k, c[4]*k, c[5]*k);
 }
 
 /* =========================================================================
@@ -928,7 +930,105 @@ function makeSphere(){
   });
 }
 makeTunnel(); makeRadial(); makeTerrain(); makeWaveform(); makeStarfield(); makeSilk(); makeSphere();
-presets.forEach(p => p.scene.background = new THREE.Color(BG));
+
+/* =========================================================================
+   TEXT OVERLAY  —  a caption held in front of the camera, dead centre.
+   It hangs off the camera rather than the scene, so it stays centred and
+   upright however the preset moves, however far the view is dragged and
+   however hard Movement is pushed. It is still inside the rendered scene, so
+   Glow and Color grade it along with everything else.
+   ========================================================================= */
+const TEXT_DIST = 2;                   // metres in front of the camera
+const TEXT_SS = 2;                     // supersample factor for crisp glyphs
+const TEXT_SWELL = 0.35;               // extra size at full level, on top of the slider
+// System font stacks — nothing is downloaded, so the caption draws on the first
+// frame. Display carries a weight as well as a family: the heavy faces it asks
+// for are missing on plenty of machines, and without the 900 it would fall back
+// to something indistinguishable from Sans.
+const FONTS = {
+  sans:      { weight:400, stack:'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif' },
+  serif:     { weight:400, stack:'Georgia, "Times New Roman", Times, serif' },
+  mono:      { weight:400, stack:'ui-monospace, "SF Mono", Menlo, Consolas, "Courier New", monospace' },
+  display:   { weight:900, stack:'"Arial Black", Impact, Haettenschweiler, system-ui, sans-serif' },
+  condensed: { weight:400, stack:'"Arial Narrow", "Helvetica Neue Condensed", "Liberation Sans Narrow", system-ui, sans-serif' }
+};
+const textCanvas = document.createElement('canvas');
+const tctx = textCanvas.getContext('2d');
+const textTex = new THREE.CanvasTexture(textCanvas);
+textTex.colorSpace = THREE.SRGBColorSpace;    // the 2D canvas hands back sRGB
+textTex.generateMipmaps = false;              // drawn ~1:1 on screen
+textTex.minFilter = THREE.LinearFilter;
+const textMat = new THREE.MeshBasicMaterial({
+  map: textTex, transparent: true, depthTest: false, depthWrite: false, fog: false
+});
+const textGeo = new THREE.PlaneGeometry(1, 1);
+let textW = 0, textH = 0;                     // rendered size in CSS pixels
+let textSwell = 1;                            // eased level-driven size multiplier
+
+// Every preset gets a content root holding what it draws, so the view transform
+// (drag + Movement) can turn the scene without turning the camera — which now
+// lives in the scene too, carrying the text quad with it.
+presets.forEach(p => {
+  p.scene.background = new THREE.Color(BG);
+  const root = new THREE.Group();
+  while (p.scene.children.length) root.add(p.scene.children[0]);
+  p.scene.add(root, p.camera);
+  p.root = root;
+  const quad = new THREE.Mesh(textGeo, textMat);
+  quad.position.z = -TEXT_DIST;
+  quad.renderOrder = 999;                     // last, over everything
+  quad.visible = false;
+  p.camera.add(quad);
+  p.textQuad = quad;
+});
+
+// Redraw the caption into its canvas. Canvas 2D resets its state whenever the
+// element is resized, so the font is measured, the canvas sized, then set again.
+function drawText(){
+  const lines = state.text.split('\n');
+  const has = state.text.trim().length > 0;
+  presets.forEach(p => p.textQuad.visible = has);
+  if(!has) return;
+  const px = state.textSize * TEXT_SS;
+  const f = FONTS[state.textFont] || FONTS.sans;
+  const font = `${f.weight} ${px}px ${f.stack}`;
+  tctx.font = font;
+  let w = 0;
+  for(const line of lines) w = Math.max(w, tctx.measureText(line).width);
+  const lh = px*1.28, padX = px*0.35, padY = px*0.30;
+  const cw = Math.max(Math.min(Math.ceil(w + padX*2), 4096), 2);
+  const ch = Math.max(Math.min(Math.ceil(lines.length*lh + padY*2), 4096), 2);
+  if(textCanvas.width !== cw || textCanvas.height !== ch){
+    // A canvas texture's GPU storage is immutable and sized by its first upload,
+    // so once the caption grows — every keystroke does — the new canvas would be
+    // pushed into the old, smaller allocation and come back as garbage. Dropping
+    // the texture makes three allocate again at the size actually being drawn.
+    textTex.dispose();
+    textCanvas.width = cw; textCanvas.height = ch;
+  }
+  tctx.clearRect(0, 0, cw, ch);                // resizing clears; same size does not
+  tctx.font = font;                           // canvas state is reset by a resize
+  tctx.textAlign = 'center'; tctx.textBaseline = 'middle';
+  tctx.fillStyle = '#ffffff';
+  for(let i=0;i<lines.length;i++) tctx.fillText(lines[i], cw/2, padY + lh*(i + 0.5));
+  textTex.needsUpdate = true;
+  textW = cw/TEXT_SS; textH = ch/TEXT_SS;
+}
+
+// Size the quad so the caption covers exactly the pixels the slider asks for,
+// whatever the preset's field of view and whatever the zoom is doing — then
+// swell it with the level. The slider size is the resting size, at silence;
+// louder pushes it up to +35%. `A.level` is already attack/release smoothed, and
+// this eases on top of it, so the caption breathes with the signal instead of
+// chattering on every frame. Damped, like every other pulse, under reduce-motion.
+function fitText(p, dt, A){
+  textSwell += ((1 + A.level*TEXT_SWELL*MOTION) - textSwell) * ease(dt, 7);
+  const quad = p.textQuad, cam = p.camera;
+  if(!quad.visible || !cam.isPerspectiveCamera) return;
+  const viewH = 2*TEXT_DIST*Math.tan(cam.fov*Math.PI/360) / Math.max(cam.zoom, 1e-4);
+  const perPx = viewH / H * textSwell;
+  quad.scale.set(textW*perPx, textH*perPx, 1);
+}
 
 /* =========================================================================
    PRESET SWITCHING + RENDER LOOP
@@ -949,6 +1049,7 @@ function loop(){
   p.camera.zoom = state.zoom; p.camera.updateProjectionMatrix();   // composes with per-preset camera motion
   updateWander(dt, Audio);
   applyView(p);
+  fitText(p, dt, Audio);
   if(fxActive){
     // glow swells a little on onsets, like every other parameter here
     if(bloomPass.enabled) bloomPass.strength = glowStrength(state.glow) * (1 + Audio.beat*0.25*MOTION);
@@ -1057,6 +1158,21 @@ document.getElementById('glow').oninput=e=>setGlow(+e.target.value);
 document.getElementById('move').oninput=e=>setMovement(+e.target.value);
 document.getElementById('colour').oninput=e=>setColour(+e.target.value);
 
+// text overlay — content, screen size, font
+const textInput=document.getElementById('textInput'), textHint=document.getElementById('textHint'),
+      textSizeVal=document.getElementById('textSizeVal');
+function refreshTextHint(){
+  const n = state.text.trim() ? state.text.split('\n').length : 0;
+  textHint.textContent = n ? (n===1 ? '1 line' : n+' lines') : 'Off';
+}
+textInput.oninput=e=>{ state.text = e.target.value; drawText(); refreshTextHint(); };
+document.getElementById('textSize').oninput=e=>{
+  state.textSize = +e.target.value;
+  textSizeVal.textContent = state.textSize + 'px';
+  drawText();
+};
+document.getElementById('textFont').onchange=e=>{ state.textFont = e.target.value; drawText(); };
+
 
 // zoom / view controls
 const zoomVal=document.getElementById('zoomVal');
@@ -1112,7 +1228,7 @@ function updateMeters(){
 
 // keyboard
 addEventListener('keydown',e=>{
-  if(e.target.tagName==='INPUT') return;
+  if(/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
   if(e.key==='h'||e.key==='H') app.classList.toggle('collapsed');
   else if(e.key==='f'||e.key==='F') toggleFs();
   else if(e.key>='1'&&e.key<='9'&&+e.key<=presets.length) selectPreset(+e.key-1);

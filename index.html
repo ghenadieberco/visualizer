@@ -45,6 +45,19 @@
     </div>
 
     <div class="grp">
+      <div class="eyebrow"><span>Text</span><span id="textHint">Off</span></div>
+      <textarea id="textInput" rows="2" spellcheck="false" placeholder="Type to overlay text…"></textarea>
+      <div class="knob-row" style="margin-top:14px"><span>Size</span><input type="range" id="textSize" min="12" max="200" value="72"><span class="kv" id="textSizeVal">72px</span></div>
+      <div class="knob-row" style="margin-top:14px"><span>Font</span><select id="textFont">
+        <option value="sans">Sans</option>
+        <option value="serif">Serif</option>
+        <option value="mono">Mono</option>
+        <option value="display">Display</option>
+        <option value="condensed">Condensed</option>
+      </select></div>
+    </div>
+
+    <div class="grp">
       <div class="eyebrow"><span>Signal</span><span id="micStatus">—</span></div>
       <button class="micbtn" id="micBtn">● Start microphone</button>
       <div class="hint" id="micHint">Listening to your microphone. Output is muted to avoid feedback — use headphones if audio is playing nearby.</div>

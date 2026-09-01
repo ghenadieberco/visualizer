@@ -424,6 +424,53 @@ input[type="range"]:focus-visible {
   letter-spacing: 0.04em;
 }
 
+textarea#textInput {
+  width: 100%;
+  resize: vertical;
+  min-height: 56px;
+  padding: 10px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.45;
+  outline: none;
+}
+textarea#textInput::placeholder {
+  color: var(--muted-2);
+}
+textarea#textInput:focus {
+  border-color: var(--amber);
+}
+select#textFont {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  height: 26px;
+  padding: 0 26px 0 9px;
+  border-radius: 6px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface)
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='5'><path d='M0 0l4 5 4-5z' fill='%23868c99'/></svg>")
+    no-repeat right 9px center;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  outline: none;
+}
+select#textFont:hover {
+  border-color: var(--amber);
+}
+select#textFont:focus-visible,
+textarea#textInput:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
 .micbtn {
   width: 100%;
   padding: 12px;
