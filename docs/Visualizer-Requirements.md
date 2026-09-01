@@ -1,9 +1,10 @@
 # Visualizer — Requirements
 
-**Version:** 0.9 (draft) · **Date:** 2026-08-31 · **Status:** For review
+**Version:** 0.10 (draft) · **Date:** 2026-09-01 · **Status:** For review
 
 A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders one of several fixed presets, animated in real time from the microphone signal. A collapsible right-hand panel selects presets and controls the view and the mic.
 
+> **Changes since 0.9:** added the **Glitch** preset — a corrupted video panel of spectrum-driven data cells, torn into sliding slices with RGB channel separation, a rolling sync bar and screen-space scanlines, bringing the set to eight.
 > **Changes since 0.8:** added a **Text** overlay — a caption held in front of the camera, dead centre, with size and system-font controls.
 > **Changes since 0.7:** added a global **Effects** panel group — Glow (bloom), Move (random drift) and Color (saturation + brightness) — and **drag-to-look** in the viewport. Presets stay fixed; these compose on top of them.
 > **Changes since 0.6:** added the **Sphere** preset — a wire-mesh globe with glowing edges whose relief is displaced by level and frequency, bringing the set to seven.
@@ -20,7 +21,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 **In scope (v1)**
 
 - Full-screen visual with a collapsible right side panel.
-- Seven fixed presets, each with baked-in reactive behavior.
+- Eight fixed presets, each with baked-in reactive behavior.
 - Microphone as the sole audio source, requested and started on first load.
 - Signal analysis: overall level (dB), frequency bands (FFT), and beat/onset detection.
 - Animation driven primarily by beat/onset pulses, with level as a secondary continuous driver — including whole-preset opacity.
@@ -46,7 +47,7 @@ A browser-based, audio-reactive visualizer. A full-screen WebGL canvas renders o
 | Text | Optional caption centred in front of the camera, with size and font controls |
 | Camera | Drag to look around; composes with zoom and each preset's own motion |
 | Target platform | Desktop browsers only |
-| Preset set | spectrum tunnel · radial spectrum burst · frequency terrain · waveform · starfield warp · liquid waves · sphere |
+| Preset set | spectrum tunnel · radial spectrum burst · frequency terrain · waveform · starfield warp · liquid waves · sphere · glitch |
 | Motion safety | Smoothed/slew-limited reactivity; honors OS reduce-motion; no full-screen strobing |
 
 ---
@@ -105,6 +106,7 @@ Three controls in a panel **Effects** group, applied to whichever preset is acti
 | 5 | Starfield Warp | Warp speed + streak length | Broadband energy | Hyperspace burst |
 | 6 | Liquid Waves | Fold amplitude + flow speed + sheen gain | Bands drive octave depth (low → drape, mid → creases, high → weave) | Ripple from centre + highlight flare |
 | 7 | Sphere | Displacement amplitude + edge glow + spin speed | Latitude samples the spectrum (equator → lows, poles → highs); bands weight the noise octaves | Ripple travelling pole to pole + rim flare |
+| 8 | Glitch | Cell brightness + readout frame rate + slice slide distance + channel-split width; highs drive the static | Each row of the panel is one FFT band (bottom of a sweep → lows, top → highs); a band's energy lights its row | Tears more slices, displaces whole tiles, and widens the RGB split |
 
 *Applies to all presets: overall opacity ← dB level (see FR-12).*
 
@@ -135,7 +137,7 @@ Three controls in a panel **Effects** group, applied to whichever preset is acti
 
 ### 3.7 Interaction
 
-- **FR-27** Keyboard shortcuts: toggle panel (`H`), toggle fullscreen (`F`), select presets (`1`–`7`), next/previous preset (arrows), zoom (`+` / `-` / `0`).
+- **FR-27** Keyboard shortcuts: toggle panel (`H`), toggle fullscreen (`F`), select presets (`1`–`8`), next/previous preset (arrows), zoom (`+` / `-` / `0`).
 - **FR-28** All interactive controls are reachable and operable by keyboard with visible focus.
 
 ---
@@ -155,8 +157,9 @@ Three controls in a panel **Effects** group, applied to whichever preset is acti
 
 ## 5. Technical approach (prototype)
 
-- Rendering: **Three.js** (WebGL2). Presets 1–5 build geometry on the CPU (instanced meshes, line sets, vertex-coloured meshes); presets 6–7 are custom GLSL `ShaderMaterial`s — simplex-noise displacement in the vertex shader, plus Kajiya-Kay anisotropic sheen (6) and barycentric wireframe (7) in the fragment shader.
+- Rendering: **Three.js** (WebGL2). Presets 1–5 build geometry on the CPU (instanced meshes, line sets, vertex-coloured meshes); presets 6–8 are custom GLSL `ShaderMaterial`s — simplex-noise displacement in the vertex shader, plus Kajiya-Kay anisotropic sheen (6) and barycentric wireframe (7) in the fragment shader, and a wholly procedural fragment shader for the panel (8).
 - Sphere preset: an icosphere (near-uniform triangles) drawn twice from one geometry and one shared uniform block — a depth-writing near-black shell that occludes the far side, then an additive pass that derives glowing, screen-constant-width edges from per-triangle barycentric coordinates via `fwidth`. Vertex displacement reads the live spectrum from a 1-D `DataTexture` indexed by latitude; surface normals come from finite differences in a tangent frame.
+- Glitch preset: a single oversized quad, everything generated in the fragment shader — rows of cells sampling the spectrum `DataTexture`, then displaced by three coordinate distortions (per-slice tearing, per-tile displacement, and a rolling sync band that shears what it crosses) before the panel is sampled once per colour channel at a small horizontal offset for the RGB split. The randomness is quantised into ~6–12 discrete frames a second and **cross-faded between steps wherever it drives brightness**, so the readout churns like a video signal without any of it becoming flicker; onsets are spent on displacement rather than on luminance, which keeps a glitch preset inside the motion-safety floor (NFR-8). Scanlines and static are keyed to `gl_FragCoord`, so they belong to the display and hold still through zoom and drag.
 - Source layout: `index.html` (markup) · `app.css` · `app.js` (ES module). The module must be served over HTTP; browsers refuse module loads from `file://`.
 - Audio: **Web Audio API** — `AnalyserNode` for FFT and time-domain data; `MediaStreamSource` from `getUserMedia` for the mic (no output node). Autoplay suspension is resolved by resuming the context on the first user gesture.
 - Beat detection: spectral-flux onset with adaptive mean-based threshold, refractory ~110 ms, exponential-decay pulse envelope.

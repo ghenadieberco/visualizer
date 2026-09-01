@@ -929,7 +929,186 @@ function makeSphere(){
     }
   });
 }
-makeTunnel(); makeRadial(); makeTerrain(); makeWaveform(); makeStarfield(); makeSilk(); makeSphere();
+/* --- 8. GLITCH : a corrupted video panel — data rows, torn slices, RGB split --- */
+function makeGlitch(){
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, W/H, 0.1, 100); camera.position.set(0,0,12);
+
+  // live spectrum as a 1-D texture, as in Sphere: here the panel's rows sample
+  // it, so every row of the readout is driven by its own slice of the FFT
+  const specData = new Uint8Array(BARS*4);
+  const specTex = new THREE.DataTexture(specData, BARS, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
+  specTex.minFilter = specTex.magFilter = THREE.LinearFilter;
+  specTex.wrapS = specTex.wrapT = THREE.ClampToEdgeWrapping;
+  specTex.generateMipmaps = false; specTex.needsUpdate = true;
+
+  const U = {
+    uSpec:{value:specTex}, uStepI:{value:0}, uStepF:{value:0},
+    uTear:{value:0}, uSlip:{value:0}, uMosh:{value:0}, uSplit:{value:0}, uRoll:{value:0},
+    uStatic:{value:0.05}, uGain:{value:1}, uOpacity:{value:1}, uPx:{value:dpr},
+    uColA:{value:new THREE.Color()}, uColB:{value:new THREE.Color()}
+  };
+
+  // One quad, all the work in the fragment shader. It is built far larger than
+  // the frame so zooming out and dragging reveal more signal rather than its
+  // edges; a wide radial falloff dissolves it into the background out there.
+  const geo = new THREE.PlaneGeometry(160, 90);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: U, transparent:true, depthWrite:false,
+    vertexShader: `
+      varying vec2 vXY;
+      void main(){ vXY = position.xy; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+    fragmentShader: `
+      uniform sampler2D uSpec;
+      uniform float uStepI, uStepF, uTear, uSlip, uMosh, uSplit, uRoll, uStatic, uGain, uOpacity, uPx;
+      uniform vec3 uColA, uColB;
+      varying vec2 vXY;
+
+      const float ROW  = 0.46;          // data row height, in panel units
+      const float NROW = 26.0;          // rows per full sweep of the spectrum
+      const float CYC  = ROW*NROW;      // ...so one sweep is about one screenful
+      const float CELL = 0.62;          // cell width
+
+      float hash21(vec2 p){
+        vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+        p3 += dot(p3, p3.yzx + 33.33);
+        return fract((p3.x + p3.y) * p3.z);
+      }
+      // The readout redraws in discrete frames like a video signal, so every
+      // random it uses is drawn at one step and cross-faded into the next.
+      // Anything driving *brightness* goes through here: the cells churn, but
+      // nothing ever hard-cuts, which is what would turn churn into flicker.
+      float hashT(vec2 p){
+        return mix(hash21(p + vec2(uStepI*17.13, uStepI*7.71)),
+                   hash21(p + vec2(uStepI*17.13 + 17.13, uStepI*7.71 + 7.71)), uStepF);
+      }
+      float spec(float f){
+        return texture2D(uSpec, vec2(f*${(BARS-1)/BARS} + ${0.5/BARS}, 0.5)).r;
+      }
+
+      // The signal itself: rows of cells, each row one FFT band, each cell lit
+      // by its own churning random weighted by that band's energy.
+      float panel(vec2 p){
+        float row = floor(p.y/ROW);
+        float e   = spec(fract(row/NROW));       // row -> bin, repeating up the panel
+        float h   = hashT(vec2(floor(p.x/CELL), row)*vec2(1.0, 1.7));
+        float v   = smoothstep(0.62, 0.96, h*0.50 + e*1.05);
+        v *= 0.55 + h*0.75;                      // ...and each lit cell keeps its own brightness
+        v = max(v, 0.04 + e*0.13);               // dim floor: the grid is always faintly there
+        // gutters between rows and cells, widened by a pixel so they stop
+        // aliasing into moire once the panel is zoomed out
+        vec2 fp = fract(p/vec2(CELL, ROW));
+        vec2 aa = fwidth(p/vec2(CELL, ROW))*1.5;
+        float gy = smoothstep(0.0, 0.10+aa.y, fp.y) * smoothstep(1.0, 0.90-aa.y, fp.y);
+        float gx = smoothstep(0.0, 0.06+aa.x, fp.x) * smoothstep(1.0, 0.94-aa.x, fp.x);
+        return v * gx * gy;
+      }
+
+      // Sync roll: a soft band travelling up the panel, dragging what it crosses.
+      float sync(vec2 p){ return smoothstep(0.045, 0.0, abs(fract((p.y - uRoll)/CYC) - 0.5)); }
+
+      // Tearing: the panel is cut into slices and a random few slide sideways.
+      // Purely positional — the slices move, nothing changes brightness — which
+      // is what keeps a glitch preset inside the motion-safety floor (NFR-8).
+      vec2 tear(vec2 p, float bar){
+        float sl = floor(p.y/(ROW*2.0));
+        vec2  k  = vec2(sl, floor(uStepI));
+        float pick = step(1.0 - uTear, hash21(k*3.17));
+        p.x += (hash21(k*7.91)*2.0 - 1.0) * pick * uSlip;
+        p.x += bar * uSlip * 0.30;
+        // ...and on an onset a few whole tiles resample from elsewhere on the
+        // panel, so they come back carrying the wrong part of the signal
+        vec2 b = floor(p/vec2(CELL*3.0, ROW*2.0));
+        vec2 kb = vec2(dot(b, vec2(1.0, 37.0)), floor(uStepI));
+        float hit = step(1.0 - uMosh, hash21(kb*1.31));
+        p += hit * (vec2(hash21(kb*5.70), hash21(kb*9.30))*2.0 - 1.0) * vec2(CELL*7.0, ROW*5.0);
+        return p;
+      }
+
+      void main(){
+        float bar = sync(vXY);
+        vec2 p = tear(vXY, bar);
+        // one sample per channel, offset sideways: the panel comes back white
+        // where it lines up and fringed cyan/red wherever the signal has an edge
+        vec3 sig = vec3(panel(p + vec2(uSplit,0.0)), panel(p), panel(p - vec2(uSplit,0.0)));
+        sig += bar*0.10;
+
+        float lum = dot(sig, vec3(0.3333));
+        vec3 c = sig * mix(uColA, uColB, smoothstep(0.22, 0.92, lum)) * uGain;
+
+        // scanlines and static belong to the display, not the scene, so both are
+        // measured in screen pixels and hold still through zoom and drag
+        float sy = gl_FragCoord.y/uPx;
+        c *= 0.90 + 0.10*cos(sy*2.0944);                        // ~3 px pitch
+        c += uColA * (hashT(gl_FragCoord.xy*0.37) - 0.5) * uStatic;
+
+        float vig = smoothstep(52.0, 22.0, length(vXY));
+        gl_FragColor = vec4(max(c, 0.0), uOpacity * vig);
+        #include <colorspace_fragment>
+      }`
+  });
+  mat.extensions = { derivatives:true };        // fwidth(): core in WebGL2, an extension in 1
+  const mesh = new THREE.Mesh(geo, mat); scene.add(mesh);
+
+  // eased envelopes on top of the audio engine's, as everywhere else
+  const sm = { level:0, high:0, beat:0 };
+  const specSm = new Float32Array(BARS);
+  let t = 0, step = 0, roll = 0, tear = 0.04, slip = 0.6, mosh = 0, split = 0.02, hue = 0.55;
+
+  presets.push({
+    name:'Glitch', desc:'corrupted signal · tears + RGB split', scene, camera,
+    resize(){ camera.aspect=W/H; camera.updateProjectionMatrix(); },
+    update(dt,A){
+      sm.level += (A.level - sm.level) * ease(dt, 5);
+      sm.high  += (A.high  - sm.high ) * ease(dt, 6);
+      sm.beat  += (A.beat  - sm.beat ) * ease(dt, 9);
+
+      const sk = ease(dt, 7);
+      for(let i=0;i<BARS;i++){
+        specSm[i] += (A.spectrum[i] - specSm[i]) * sk;
+        const v = Math.max(0, Math.min(255, specSm[i]*255))|0;
+        specData[i*4]=v; specData[i*4+1]=v; specData[i*4+2]=v; specData[i*4+3]=255;
+      }
+      specTex.needsUpdate = true;
+
+      t += dt;
+      // ~6-12 frames a second, so the readout churns at video rate instead of
+      // at whatever the display happens to run at
+      step += dt * (6 + sm.level*6) * MOTION;
+      U.uStepI.value = Math.floor(step);
+      U.uStepF.value = step - Math.floor(step);
+      roll = (roll + dt*MOTION*(0.9 + sm.level*1.8)) % (0.46*26);
+
+      // how much tears, how far they slide, and how wide the channels separate:
+      // all slew-limited, so an onset rips the picture over a few frames
+      tear  += ((0.04 + sm.beat*0.40 + sm.level*0.10)*MOTION - tear ) * ease(dt, 6);
+      slip  += ((0.60 + sm.level*2.20 + sm.beat*3.20)*MOTION - slip ) * ease(dt, 4);
+      mosh  += ((sm.beat*0.13 + sm.level*0.02)*MOTION - mosh ) * ease(dt, 5);
+      split += ((0.010 + sm.level*0.045 + sm.beat*0.085)*MOTION - split) * ease(dt, 5);
+      hue   += ((0.55 - sm.high*0.12) - hue) * ease(dt, 1.5);
+
+      U.uTear.value = tear; U.uSlip.value = slip; U.uMosh.value = mosh;
+      U.uSplit.value = split; U.uRoll.value = roll;
+      U.uStatic.value = 0.09 + sm.high*0.18 + sm.beat*0.04;
+      // onsets are spent on tearing, not on brightness: this panel fills the
+      // whole frame, so a beat term big enough to see here would be a full-field
+      // luminance swing — the one thing NFR-8 rules out
+      U.uGain.value = 0.90 + sm.level*0.45 + sm.beat*0.20;
+      U.uOpacity.value = A.opacity;
+
+      const hu = (hue + A.time*0.010) % 1;
+      U.uColA.value.copy(col.setHSL(hu, 0.90, 0.26));            // dim cells, cold
+      U.uColB.value.copy(col.setHSL((hu + 0.52) % 1, 0.62, 0.88)); // hot cells, near-white
+
+      // a slow parallax slide across the panel, plus a push-in on loud passages
+      camera.position.x = Math.sin(t*0.13)*0.35*MOTION;
+      camera.position.y = Math.cos(t*0.11)*0.22*MOTION;
+      camera.position.z = 12 - sm.level*0.8 - sm.beat*0.5;
+    }
+  });
+}
+
+makeTunnel(); makeRadial(); makeTerrain(); makeWaveform(); makeStarfield(); makeSilk(); makeSphere(); makeGlitch();
 
 /* =========================================================================
    TEXT OVERLAY  —  a caption held in front of the camera, dead centre.
