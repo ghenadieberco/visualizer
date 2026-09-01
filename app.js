@@ -3,7 +3,7 @@ import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass }      from 'three/addons/postprocessing/ShaderPass.js';
-import { Pass }            from 'three/addons/postprocessing/Pass.js';
+import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 
 /* =========================================================================
    RENDERER
@@ -20,12 +20,13 @@ sizeRenderer();
 // global view + effect state shared by all presets
 //   zoom     camera zoom (0.3 - 6)
 //   glow     bloom amount, 0 = off (post-pass bypassed entirely)
+//   flare    lens-flare amount, 0 = off (its passes bypassed entirely)
 //   movement extra random drift on top of the preset's own motion, 0 = off
 //   colour   saturation + brightness multiplier, 1 = the preset's own look
 //   orbit    look direction from dragging the viewport (pitch, yaw in radians)
 //   text     overlay caption: its lines, screen size in px, font stack key,
 //            fill colour, and its own glow — deliberately separate from `glow`
-const state = { zoom: 1, glow: 0, movement: 0, colour: 1, orbit:{ x:0, y:0 },
+const state = { zoom: 1, glow: 0, flare: 0, movement: 0, colour: 1, orbit:{ x:0, y:0 },
                 text: '', textSize: 72, textFont: 'sans',
                 textColour: '#ffffff', textGlow: 0 };
 
@@ -34,10 +35,10 @@ const REDUCED_MOTION = window.matchMedia && window.matchMedia('(prefers-reduced-
 const MOTION = REDUCED_MOTION ? 0.5 : 1;
 
 /* =========================================================================
-   POST-PROCESSING  —  Glow (bloom) and Color (saturation + brightness).
-   While both sit at their defaults the composer is skipped entirely and the
-   scene renders straight to the canvas, so an untouched panel costs nothing
-   and looks exactly as it always has.
+   POST-PROCESSING  —  Glow (bloom), Flare (lens artifact) and Color
+   (saturation + brightness). While all three sit at their defaults the
+   composer is skipped entirely and the scene renders straight to the canvas,
+   so an untouched panel costs nothing and looks exactly as it always has.
    ========================================================================= */
 // The slider drives strength, threshold and radius together. Strength alone
 // reads as on/off: a fixed threshold means every bright pixel blooms the moment
@@ -85,10 +86,212 @@ const gradePass = new ShaderPass({
 });
 const bloomPass = new UnrealBloomPass(new THREE.Vector2(W, H), 0, 0.45, 0.5);
 bloomPass.enabled = false;
+
+/* -------------------------------------------------------------------------
+   LENS FLARE  —  the camera artifact a bright preset would throw in a real
+   lens: ghosts mirrored through the centre of frame and an anamorphic streak.
+   There is deliberately no halo ring, the third feature the textbook version
+   has. It assumes small, point-like sources; every preset here is a bright
+   object filling most of the frame, so its ring covers the screen and the
+   effect collapses into a smear rather than reading as a lens. It is derived from the frame itself, so nothing has to be
+   authored per preset — whatever a preset draws brightly flares, and a preset
+   with nothing hot in it produces nothing.
+   It is generated from the scene *before* the bloom, so it fires on the
+   preset's own hot pixels whether or not Glow is up and the two sliders stay
+   independent — two artifacts of the same light rather than one feeding the
+   other. Four steps, all but the composite at quarter resolution: threshold
+   the frame, build the features, soften them with a separable blur, then add
+   the result over the frame.
+   ------------------------------------------------------------------------- */
+const FLARE_DIV = 4;                        // flare buffers run at 1/4 the drawing buffer
+// As with Glow, the slider sweeps the threshold as well as the strength: low
+// settings flare only on the hottest cores, high settings pull more of the
+// image into it, so the travel across the slider is visible rather than on/off.
+// The range is set from what the presets actually put on screen, not from the
+// nominal 0-1: measured across the set, linear luminance peaks around 0.5-0.9
+// and only a per-cent or two of the frame clears 0.5, so a bloom-like 0.85
+// threshold would leave the whole slider dead.
+const flareStrength   = t => 1.3 * Math.pow(t, 1.5);
+const flareThreshold  = t => 0.55 - 0.37*t;   // 0.55 (hottest cores only) -> 0.18
+const flareDistortion = t => 0.0015 + 0.0035*t; // chromatic split between the R and B ghosts, in uv
+const FLARE_VERT = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`;
+const flareMat = (uniforms, fragmentShader) => new THREE.ShaderMaterial({
+  uniforms, fragmentShader, vertexShader: FLARE_VERT, depthTest: false, depthWrite: false
+});
+
+class FlarePass extends Pass {
+  constructor(){
+    super();
+    this.needsSwap = false;                 // writes only to its own buffers
+    // No depth: these are pure image buffers, and without a depth attachment
+    // there is nothing for a stale, never-cleared depth test to reject.
+    const opts = { type:THREE.HalfFloatType, samples:0, depthBuffer:false };
+    this.rtA = new THREE.WebGLRenderTarget(1, 1, opts);
+    this.rtB = new THREE.WebGLRenderTarget(1, 1, opts);
+    this.fsQuad = new FullScreenQuad();
+
+    // 1. bright pass: full-res in, quarter-res out
+    this.bright = flareMat(
+      { tDiffuse:{value:null}, uTexel:{value:new THREE.Vector2()}, uThreshold:{value:0.85} }, `
+      uniform sampler2D tDiffuse; uniform vec2 uTexel; uniform float uThreshold;
+      varying vec2 vUv;
+      const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);       // Rec.709, linear space
+      // Each tap is thresholded on its own, at full resolution, and only then
+      // averaged. Thresholding the average instead throws the whole effect
+      // away on this content: a preset is mostly one-pixel bright lines, and a
+      // line averaged over a quarter-resolution texel lands far below any
+      // threshold that the background does not also cross.
+      vec3 tap(vec2 uv){
+        vec3 c = min(max(texture2D(tDiffuse, uv).rgb, 0.0), vec3(64.0));   // bounded: feeds three more passes
+        // a NaN would survive every blur below and smear across the frame
+        if(!(c.r >= 0.0) || !(c.g >= 0.0) || !(c.b >= 0.0)) return vec3(0.0);
+        float l = dot(c, LUMA);
+        // Soft knee, so a pixel crossing the threshold fades in instead of
+        // popping — then clamped to 1. Without the clamp the flare tracks raw
+        // scene luminance, and the presets differ by several stops: the ones
+        // that run hot blow the effect out at settings where the dim ones show
+        // nothing. Clamping asks "how much of this pixel is over the line",
+        // which is comparable across the set.
+        return min(c * max(l - uThreshold, 0.0) / max(l, 1e-4), vec3(1.0));
+      }
+      void main(){
+        // Four taps a texel apart rather than one: point-sampling thin lines
+        // down to a quarter makes the flare crawl as they move between texels.
+        // They are combined with max, not an average — a one-pixel line covers
+        // a sixteenth of a quarter-resolution texel, and averaging hands back a
+        // sixteenth of its brightness, which is most of this app's content
+        // thrown away. The clamp above is what makes max safe.
+        vec3 c = max(max(tap(vUv + uTexel), tap(vUv - uTexel)),
+                     max(tap(vUv + vec2( uTexel.x, -uTexel.y)),
+                         tap(vUv + vec2(-uTexel.x,  uTexel.y))));
+        gl_FragColor = vec4(c, 1.0);
+      }`);
+
+    // 2. features: ghosts + streak, quarter-res throughout
+    this.features = flareMat(
+      { tBright:{value:null}, uTexel:{value:new THREE.Vector2()}, uAspect:{value:1},
+        uDistortion:{value:0.005} }, `
+      uniform sampler2D tBright; uniform vec2 uTexel; uniform float uAspect, uDistortion;
+      varying vec2 vUv;
+      const int GHOSTS = 4;                  // ghosts marching in from the mirrored point
+      const int STREAK = 10;                 // streak taps per side
+      const float DISPERSAL = 0.30;          // spacing of the ghosts along the centre line
+      const float STREAK_SPREAD = 8.0;       // texels between streak taps
+      // The R and B channels are sampled a little either side of G along the
+      // flare's own axis: real ghosts are chromatically split, and without it
+      // they read as grey smudges rather than lens artifacts.
+      vec3 chroma(vec2 uv, vec2 dir){
+        return vec3(texture2D(tBright, uv + dir*uDistortion).r,
+                    texture2D(tBright, uv).g,
+                    texture2D(tBright, uv - dir*uDistortion).b);
+      }
+      // 0 at the centre of frame, 1 at the corner — aspect-corrected, so the
+      // ghosts stay circular on a wide window
+      float radial(vec2 uv){
+        return length((uv - 0.5) * vec2(uAspect, 1.0)) / length(vec2(0.5*uAspect, 0.5));
+      }
+      void main(){
+        vec2 uv = vec2(1.0) - vUv;           // ghosts are the frame mirrored through its centre
+        vec2 ghostVec = (vec2(0.5) - uv) * DISPERSAL;
+        float glen = length(ghostVec);
+        vec2 dir = glen > 1e-5 ? ghostVec/glen : vec2(0.0);   // undefined exactly at the centre
+        vec3 flare = vec3(0.0);
+        for(int i=0;i<GHOSTS;i++){
+          vec2 off = uv + ghostVec*float(i);
+          flare += chroma(off, dir) * pow(max(1.0 - radial(off), 0.0), 3.0);
+        }
+        // a lens is not colour-neutral: a soft cast that shifts with radius is
+        // what separates a ghost from a dim copy of the scene
+        flare *= 0.86 + 0.14*cos(6.2831853*(vec3(0.0, 0.33, 0.67) + radial(vUv)*0.9));
+        // anamorphic streak — in screen space, not mirrored, so it sits on the
+        // bright thing itself
+        vec3 streak = vec3(0.0); float wsum = 0.0;
+        for(int i=0;i<=2*STREAK;i++){
+          float k = float(i - STREAK), f = k/float(STREAK), w = exp(-f*f*2.5);
+          streak += texture2D(tBright, vUv + vec2(k*uTexel.x*STREAK_SPREAD, 0.0)).rgb * w;
+          wsum += w;
+        }
+        // Gains, not physics. The streak is a normalised gaussian, so a line
+        // spread over 21 taps keeps only a ninth of its peak and has to be
+        // scaled back up; it is also the feature that carries the effect here,
+        // because it sits *on* the bright thing. The ghosts are held far
+        // lower: they are copies of the whole frame, and on presets that fill
+        // it they stop reading as discrete artifacts and become a wash.
+        gl_FragColor = vec4(flare*0.12 + streak/wsum * vec3(0.45, 0.70, 1.15) * 3.5, 1.0);
+      }`);
+
+    // 3. separable blur: the ghosts are copies of the scene until they are
+    //    softened, and hard-edged copies read as a double exposure, not a lens
+    this.blur = flareMat(
+      { tDiffuse:{value:null}, uTexel:{value:new THREE.Vector2()}, uDir:{value:new THREE.Vector2()} }, `
+      uniform sampler2D tDiffuse; uniform vec2 uTexel, uDir; varying vec2 vUv;
+      void main(){
+        vec2 s = uTexel * uDir;              // five bilinear taps ~ a nine-tap gaussian
+        vec3 c = texture2D(tDiffuse, vUv).rgb * 0.227027;
+        c += (texture2D(tDiffuse, vUv + s*1.3846).rgb + texture2D(tDiffuse, vUv - s*1.3846).rgb) * 0.316216;
+        c += (texture2D(tDiffuse, vUv + s*3.2308).rgb + texture2D(tDiffuse, vUv - s*3.2308).rgb) * 0.070270;
+        gl_FragColor = vec4(c, 1.0);
+      }`);
+  }
+  get texture(){ return this.rtB.texture; }
+  setSize(w, h){                             // called by the composer in drawing-buffer pixels
+    const fw = Math.max(1, Math.round(w/FLARE_DIV)), fh = Math.max(1, Math.round(h/FLARE_DIV));
+    this.rtA.setSize(fw, fh); this.rtB.setSize(fw, fh);
+    this.bright.uniforms.uTexel.value.set(1/w, 1/h);        // reads the full-res frame
+    this.features.uniforms.uTexel.value.set(1/fw, 1/fh);
+    this.features.uniforms.uAspect.value = fw/fh;
+    this.blur.uniforms.uTexel.value.set(1/fw, 1/fh);
+  }
+  render(renderer, writeBuffer, readBuffer){
+    const draw = (mat, target) => {
+      this.fsQuad.material = mat;
+      renderer.setRenderTarget(target);
+      this.fsQuad.render(renderer);
+    };
+    this.bright.uniforms.tDiffuse.value = readBuffer.texture;
+    draw(this.bright, this.rtA);
+    this.features.uniforms.tBright.value = this.rtA.texture;
+    draw(this.features, this.rtB);
+    this.blur.uniforms.tDiffuse.value = this.rtB.texture;
+    this.blur.uniforms.uDir.value.set(1, 0);
+    draw(this.blur, this.rtA);
+    this.blur.uniforms.tDiffuse.value = this.rtA.texture;
+    this.blur.uniforms.uDir.value.set(0, 1);
+    draw(this.blur, this.rtB);               // the chain's own buffers are left untouched
+  }
+}
+const flarePass = new FlarePass();
+flarePass.enabled = false;
+// The only full-resolution step: add the finished flare over the frame. Kept
+// separate from the grade so it lands *under* the text overlay — the caption is
+// meant to stay legible, not to be veiled by a lens artifact.
+const flareComposite = new ShaderPass({
+  uniforms: { tDiffuse:{value:null}, tFlare:{value:null}, uAmount:{value:0} },
+  vertexShader: FLARE_VERT,
+  fragmentShader: `
+    uniform sampler2D tDiffuse, tFlare; uniform float uAmount; varying vec2 vUv;
+    void main(){
+      vec4 base = texture2D(tDiffuse, vUv);
+      vec3 f = texture2D(tFlare, vUv).rgb * uAmount;
+      // Soft roll-off, and the reason one slider can serve every preset: the
+      // set spans several stops, so a gain that makes Spectrum Tunnel flare at
+      // all blows Waveform out. Compressing the top end leaves the dim presets
+      // very nearly linear and bounds the bright ones at 1/0.7.
+      gl_FragColor = vec4(base.rgb + f/(1.0 + f*0.7), base.a);
+    }`
+});
+// Bound after construction, not in the shader object above: ShaderPass clones
+// the uniforms it is handed, and cloneUniforms() refuses to clone a render
+// target's texture — it substitutes null and warns.
+flareComposite.uniforms.tFlare.value = flarePass.texture;
+flareComposite.enabled = false;
+
 composer.addPass(renderPass);
+composer.addPass(flarePass);                // reads the raw frame; writes only its own buffers
 composer.addPass(bloomPass);
-// The text overlay inserts itself here (see TEXT OVERLAY): after the bloom, so
-// the global Glow can never reach the caption, and before the grade, so Color
+composer.addPass(flareComposite);
+// The text overlay inserts itself here (see TEXT OVERLAY): after the bloom and
+// the flare, so neither can reach the caption, and before the grade, so Color
 // still applies to it along with everything else.
 composer.addPass(gradePass);                // last: grades and encodes to sRGB
 function sizeComposer(){
@@ -107,7 +310,8 @@ sizeComposer();
 let fxActive = false;
 function refreshFx(){
   bloomPass.enabled = state.glow > 0;
-  fxActive = bloomPass.enabled || state.colour !== 1;
+  flarePass.enabled = flareComposite.enabled = state.flare > 0;
+  fxActive = bloomPass.enabled || flarePass.enabled || state.colour !== 1;
 }
 
 /* =========================================================================
@@ -1135,15 +1339,27 @@ makeTunnel(); makeRadial(); makeTerrain(); makeWaveform(); makeStarfield(); make
    ========================================================================= */
 const TEXT_SS = 2;                     // supersample factor for crisp glyphs
 const TEXT_SWELL = 0.35;               // extra size at full level, on top of the slider
-// Text Glow is painted, not post-processed: the caption is drawn a second time
-// into a companion canvas through a canvas-2D shadow, and that halo is laid
-// under the glyphs additively. Radius and opacity both ramp with the slider, so
-// low settings read as a tight rim and high settings as a wide corona. Keeping
-// the halo on its own quad means its intensity can pulse every frame without
+// Text Glow is painted, not post-processed: the caption is drawn again into a
+// companion canvas through canvas-2D shadows, and that halo is laid under the
+// glyphs additively. Radius and opacity both ramp with the slider, so low
+// settings read as a tight rim and high settings as a wide corona. Keeping the
+// halo on its own quad means its intensity can pulse every frame without
 // anything being redrawn.
-const textGlowBlur  = t => 0.08 + 0.42*t;   // shadow radius, as a fraction of the font size
-const textGlowAlpha = t => 0.35 + 0.65*t;   // opacity of the halo quad
-const TEXT_GLOW_PASSES = 3;            // stacked shadow draws; one alone is too thin to read
+const textGlowBlur  = t => 0.08 + 0.42*t;   // widest shadow radius, as a fraction of the font size
+const textGlowAlpha = t => 0.45 + 0.75*t;   // opacity of the halo quad
+// Light does not fall off at one rate. A single blur — or the same blur stacked
+// to deepen it — gives a flat, evenly lit collar that reads as a sticker behind
+// the text. Four shadows at shrinking radii, accumulated as light rather than
+// paint, give a hot rim tight against the glyph decaying into a wide corona:
+// the same layered-additive trick the Waveform preset uses on its trace, and
+// the reason it looks like a lit object rather than a blurred copy.
+const TEXT_GLOW_LAYERS = [
+  { r: 1.00, a: 0.55 },                     // wide corona
+  { r: 0.46, a: 0.62 },
+  { r: 0.19, a: 0.78 },
+  { r: 0.07, a: 0.95 }                      // hot rim, right at the glyph edge
+];
+const hexRGB = h => /^#[0-9a-f]{6}$/i.test(h) ? [1,3,5].map(i => parseInt(h.slice(i, i+2), 16)) : [255,255,255];
 // System font stacks — nothing is downloaded, so the caption draws on the first
 // frame. Display carries a weight as well as a family: the heavy faces it asks
 // for are missing on plenty of machines, and without the 900 it would fall back
@@ -1255,21 +1471,32 @@ function drawText(){
   }
   // Both canvases are the same size and take the same strokes, so the halo sits
   // exactly under the glyphs however the two quads are scaled.
-  const paint = ctx => {
+  const paint = (ctx, dx = 0) => {
     ctx.font = font;                          // canvas state is reset by a resize
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillStyle = state.textColour;
-    for(let i=0;i<lines.length;i++) ctx.fillText(lines[i], cw/2, padY + lh*(i + 0.5));
+    for(let i=0;i<lines.length;i++) ctx.fillText(lines[i], cw/2 + dx, padY + lh*(i + 0.5));
   };
   tctx.clearRect(0, 0, cw, ch);                // resizing clears; same size does not
   paint(tctx);
   textTex.needsUpdate = true;
   gctx.clearRect(0, 0, cw, ch);
   if(glowOn){
-    gctx.shadowColor = state.textColour;       // the halo takes the caption's own colour
-    gctx.shadowBlur = blur;
-    for(let i=0;i<TEXT_GLOW_PASSES;i++) paint(gctx);
-    gctx.shadowBlur = 0;
+    const [r, g, b] = hexRGB(state.textColour);   // the halo takes the caption's own colour
+    // Only the shadow is wanted, never a second copy of the glyphs: the text is
+    // drawn well off the left edge and its shadow offset back onto the canvas.
+    // Letting the glyphs land here too would stack four opaque copies under the
+    // crisp layer and burn the core out to white at any real setting.
+    const off = cw + blur*2 + 16;
+    gctx.globalCompositeOperation = 'lighter';    // layers accumulate as light, not as paint
+    gctx.shadowOffsetX = off;
+    for(const L of TEXT_GLOW_LAYERS){
+      gctx.shadowColor = `rgba(${r}, ${g}, ${b}, ${L.a})`;
+      gctx.shadowBlur = Math.max(blur*L.r, 0.5);  // a sub-pixel radius draws nothing at all
+      paint(gctx, -off);
+    }
+    gctx.shadowOffsetX = 0; gctx.shadowBlur = 0; gctx.shadowColor = 'transparent';
+    gctx.globalCompositeOperation = 'source-over';
   }
   glowTex.needsUpdate = true;
   textW = cw/TEXT_SS; textH = ch/TEXT_SS;
@@ -1321,6 +1548,9 @@ function loop(){
   if(fxActive){
     // glow swells a little on onsets, like every other parameter here
     if(bloomPass.enabled) bloomPass.strength = glowStrength(state.glow) * (1 + Audio.beat*0.25*MOTION);
+    // the flare swells with it, but no harder: a lens artifact pumping on every
+    // beat is exactly the full-frame flicker the motion-safety floor rules out
+    if(flarePass.enabled) flareComposite.uniforms.uAmount.value = flareStrength(state.flare) * (1 + Audio.beat*0.25*MOTION);
     renderPass.scene = p.scene; renderPass.camera = p.camera;
     composer.render();
   } else {
@@ -1409,13 +1639,22 @@ document.getElementById('sens').oninput=e=>{
   sensVal.textContent=e.target.value+'%';
 };
 
-// effects — glow (bloom), movement (random drift) and colour (saturation + brightness)
-const glowVal=document.getElementById('glowVal'), moveVal=document.getElementById('moveVal'), colourVal=document.getElementById('colourVal');
+// effects — glow (bloom), flare (lens artifact), movement (random drift) and
+// colour (saturation + brightness)
+const glowVal=document.getElementById('glowVal'), flareVal=document.getElementById('flareVal'),
+      moveVal=document.getElementById('moveVal'), colourVal=document.getElementById('colourVal');
 function setGlow(v){
   state.glow = v/100;
   bloomPass.threshold = glowThreshold(state.glow);
   bloomPass.radius    = glowRadius(state.glow);
   glowVal.textContent = v>0 ? v+'%' : 'Off';
+  refreshFx();
+}
+function setFlare(v){
+  state.flare = v/100;
+  flarePass.bright.uniforms.uThreshold.value = flareThreshold(state.flare);
+  flarePass.features.uniforms.uDistortion.value = flareDistortion(state.flare);
+  flareVal.textContent = v>0 ? v+'%' : 'Off';
   refreshFx();
 }
 function setColour(v){
@@ -1430,6 +1669,7 @@ function setMovement(v){
   moveVal.textContent = v>0 ? v+'%' : 'Off';
 }
 document.getElementById('glow').oninput=e=>setGlow(+e.target.value);
+document.getElementById('flare').oninput=e=>setFlare(+e.target.value);
 document.getElementById('move').oninput=e=>setMovement(+e.target.value);
 document.getElementById('colour').oninput=e=>setColour(+e.target.value);
 
